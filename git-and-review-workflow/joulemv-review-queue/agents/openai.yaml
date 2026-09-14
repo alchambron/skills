@@ -1,0 +1,4 @@
+interface:
+  display_name: "JouleMV review queue"
+  short_description: "Teams-ready human review actions by person"
+  default_prompt: "Use $joulemv-review-queue to prepare a Teams-ready message listing only pending reviews and responses to human feedback by person, with PR links and estimated progress."

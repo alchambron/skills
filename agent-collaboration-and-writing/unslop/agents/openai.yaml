@@ -1,0 +1,3 @@
+interface:
+  display_name: "Unslop"
+  short_description: "Edit prose to remove AI writing patterns"

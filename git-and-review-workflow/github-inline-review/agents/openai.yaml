@@ -1,0 +1,4 @@
+interface:
+  display_name: "GitHub inline review"
+  short_description: "Publish the conversation review as Request changes"
+  default_prompt: "Use $github-inline-review to publish the latest review in this conversation as Request changes, with findings attached to the correct diff lines."
