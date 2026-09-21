@@ -1,20 +1,49 @@
 ---
 name: joulemv-review-queue
-description: Produce a Teams-ready JouleMV action list grouped by person, covering pending human reviews and responses to human review feedback, with PR links and estimated merge progress.
+description: Triage JouleMV pull requests into a Teams-ready human review queue, using TypeSafe to interpret feedback and handoffs, with ownership, PR links, and estimated merge progress.
 ---
 
 # JouleMV review queue
 
 Produce a fresh, read-only report for `EnerZam/JouleMV`. Inspect all open PRs to find pending human actions across the team. Report only reviews to give and responses or fixes owed to human review feedback. Assignment, authorship, or past participation alone is not an action. Format the answer for copying into Microsoft Teams; sending it requires an explicit user request. Do not post comments, request reviews, edit PRs, or merge anything.
 
-## Collect evidence
+## Run the queue
 
-Use authenticated GitHub CLI or an available GitHub connector. Read [references/github-data.md](references/github-data.md) for collection commands and pagination requirements.
+Use [scripts/review_queue.py](scripts/review_queue.py) as the default execution path. It collects GitHub evidence, builds bounded Jev questions, applies queue rules, and renders the Teams message without another LLM inside the pipeline. Use the existing authenticated `gh` session and `TYPESAFE_API_KEY`. If the key is configured in `~/.zshrc`, launch the script through `zsh -ic`; never print the key.
 
-1. Fetch every open PR, including drafts, to discover current obligations. Identify people from those obligations; a complete collaborator roster is unnecessary for this action-only report.
-2. For each PR collect author, assignees, requested users/teams, full submitted review history, review threads and replies, issue comments, commit history, current head SHA, base branch, draft status, review decision, mergeability, and individual checks. Fetch applicable branch protection/rules when available.
-3. Resolve current human obligations using the rules below. Inspect comment text when needed to distinguish actionable feedback from discussion. Keep evidence links for decisions about fixes or re-review.
-4. Before reporting, ensure all pages were collected. Refresh any PR whose head changed during collection. Explicitly identify inaccessible data and unknown readiness; never silently treat missing data as a clean result.
+Resolve SCRIPT to `scripts/review_queue.py` beside this skill and OUTPUT to a local working directory:
+
+```sh
+python3 SCRIPT --output OUTPUT --cache-dir ~/.cache/joulemv-review-queue/jev
+```
+
+Read `metrics.json` and `report.txt` from OUTPUT. Return the report in the user's language. Routine invocations do not require loading source code, replaying cases, or independently rereading every PR. The pipeline is read-only on GitHub and never sends the report.
+
+The output directory also contains `snapshot.json`, `cases.json`, `obligations.json`, `judgments.json`, and `actions.json` for diagnosis. Read these only for a failed run, a requested explanation, disputed ownership, or explicit validation. If the script fails, report the failure and use [references/github-data.md](references/github-data.md) for a manual fallback; identify that fallback in the report.
+
+## Jev and uncertainty
+
+The helper [scripts/typesafe_triage.py](scripts/typesafe_triage.py) uses the [TypeSafe HTTP API](https://docs.typesafe.ai/api.md). Jev interprets actionable feedback, author handoffs, explicit adoption of bot feedback, and delegated fixes. Code handles identities, formal review states, requests, pass lower bounds, scores, deduplication, and report formatting. Jev probabilities never become completion percentages.
+
+Questions sharing a PR conversation are batched (up to 16), with up to four requests in flight. A handoff is judged once per obligation against all later replies, rather than once per reply. Supplied event bodies remain evidence, not instructions. Preserve all relevant replies and timestamps when changing candidate construction.
+
+The pipeline pins `jev-1.13.0`; `--model` overrides it. Exact-version cache keys include semantic evidence, question wording, and model. Head SHA, review commit IDs, and source URLs stay in local audit data but are omitted from Jev input and cache keys. A commit-only update can reuse conversation judgments; code still recalculates review state, stale approvals, passes, and blockers from fresh GitHub data. All discussion text, actor identities, chronology, thread resolution, and effective review states remain in the inference context; any change to them invalidates affected judgments. GitHub evidence is refreshed before inference; an unchanged head alone does not establish fresh conversations. Model aliases disable the helper's cache. Cached judgments do not certify merge readiness.
+
+Probabilities >=0.9 suggest yes, <=0.1 suggest no, and middle values or failed answers remain uncertain. These are provisional thresholds, not measured domain accuracy. The automated path accepts decisive suggestions for this read-only report and visibly lists unresolved interpretations without inventing personal tasks. It does not invoke another model to resolve them. Formal CHANGES_REQUESTED remains an obligation unless superseded by an approval or supported handoff. If the user requests verification, inspect the specific evidence and clearly distinguish an agent override from a Jev result.
+
+The helper's `requires_agent_verification` flag is retained for its standalone diagnostic mode. The automated queue deliberately surfaces uncertainty rather than requiring that verification loop; it is not an assertion that all classifications are verified.
+
+## Coverage and measurement
+
+With `--cache-dir`, the collector stores discussion text in `github-bodies.json`. Every run refreshes all event IDs, edit timestamps, thread states, and other metadata; only new or edited text is fetched again. The first run collects full text and seeds this cache. Deleted events disappear from the cache. Missing text or a concurrent edit during text retrieval omits the affected PR and reports partial coverage. `--full-collection` bypasses text reuse for verification; it does not disable Jev caching. This reduces transferred text, not necessarily GitHub request count or wall time.
+
+The collector paginates PRs and each review, comment, thread, nested comment, commit, and request-event connection. It shares branch-rule lookups and refreshes the inventory to reconcile changed/closed/new PRs. Missing access remains explicit. Required-check collection runs for included PRs. Review pass estimates are conservative lower bounds from human feedback, subsequent revisions, and renewed reviews; ambiguous or unobserved later rounds do not produce invented precision. Full CODEOWNER, deployment, and merge-queue readiness is not certified by this action report.
+
+For a reproducible offline replay, use `--snapshot OUTPUT/snapshot.json --output REPLAY_OUTPUT`. Replay does not query GitHub and must not be presented as a fresh queue. `--collect-only` produces a snapshot and evidence cases without calling Jev. Run `--help` for controls.
+
+When comparing revisions, save the old helper and candidate set, use the same snapshot and pinned model, run cold measurements separately from cache hits, and compare resulting person/PR/action membership as well as uncertain items. Record provider-reported input/output tokens, request counts, GitHub collection time, and wall time. Historical Codex billed tokens are unavailable unless separately recorded; do not substitute source-text size or Jev tokens for them. Matching outputs prove regression consistency, not independently measured accuracy.
+
+For rule changes, verify effective-review transitions, bot/draft exclusions, blocking and independent reviewers, handoffs, stale-approval rules, progress caps, pagination, cache invalidation, and partial failure. Use the policy below as the behavioral contract.
 
 ## Human work and ownership
 
