@@ -9,20 +9,41 @@ Use the PR number supplied by the user, if any. Otherwise, find the PR for the c
 
 ## Establish the current feedback
 
-1. Fetch the PR title, head, base, reviews, general comments, and all pages of inline review comments. Use the current repository from `gh repo view`, not a hard-coded owner or repo. Include comment IDs or URLs, authors, paths, lines, timestamps, and reply relationships so each item remains traceable.
+1. Fetch PR metadata, reviews, general comments, and inline comments from the current repository. Set `PR` to the supplied number or to `gh pr view --json number --jq .number`:
+
+   ```bash
+   REPO=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
+   gh pr view "$PR" --json number,url,title,headRefName,baseRefName
+   gh api --paginate "repos/$REPO/pulls/$PR/reviews?per_page=100"
+   gh api --paginate "repos/$REPO/issues/$PR/comments?per_page=100"
+   gh api --paginate "repos/$REPO/pulls/$PR/comments?per_page=100"
+   gh pr diff "$PR"
+   ```
+
+   Keep comment IDs or URLs, authors, paths, lines, timestamps, and `in_reply_to_id` where present. Paginate review threads and their replies through GraphQL when checking resolution; the REST inline-comment list alone does not give thread resolution status.
 2. Check review-thread resolution and later replies. Separate open human requests from resolved threads, superseded requests, bot suggestions, and questions already answered. Do not count replies as new independent findings.
 3. Read the PR's merge-base diff and the relevant current code. Verify whether each requested change is still needed; a comment may refer to an older commit. Preserve the reviewer's observed behavior even when a test or static reading does not reproduce it.
 
-## Decide and report
+## Plan each comment
 
 Present every review comment in a compact table, including comments that are resolved, superseded, or not actionable. Keep one row per original comment or thread; fold replies into that row. Link each comment and briefly state its current status in the Comment cell. Use these columns:
 
 | Comment | Important? | Valuable? | Solution for this comment |
 | --- | --- | --- | --- |
-| [Reviewer: concise summary](comment URL) (open/resolved/already addressed) | Important / Not important — brief reason | Valuable / Not valuable — brief reason | Specific code change, verification, or reviewer reply; say “no change” and why when appropriate. |
+| [Reviewer: concise summary](comment URL) (open/resolved/already addressed) | Important / Not important — brief reason | Valuable / Not valuable — brief reason | Fix / Answer / Defer / No change: specific action and how to verify it. |
 
 Judge **importance** by whether the issue needs action before merge, especially for correctness, security, data loss, or a meaningful user regression. Judge **value** by whether the feedback is valid and improves the PR, even when it is not merge-blocking. If evidence is insufficient, say “Needs verification” in the relevant cell and name the check in the solution. Do not equate a resolved thread with a verified fix.
 
-After the table, give a short ordered implementation plan and verification steps for the comments that need work. When a solution needs more than a few sentences, keep its table cell concise and add a numbered explanation below keyed to that row. State which items are already addressed and which need a reviewer answer. Avoid claiming a comment is resolved or a fix is deployed solely from local code or tests.
+Give every comment a disposition: **Fix**, **Answer**, **Defer**, or **No change**, with a reason. After the table, give a short ordered implementation plan and verification steps for the comments that need work. When a solution needs more than a few sentences, keep its table cell concise and add a numbered explanation below keyed to that row. Draft a reviewer reply for comments needing an answer, deferral, or explanation. State which items are already addressed and which need a reviewer answer. Avoid claiming a comment is resolved or a fix is deployed solely from local code or tests.
+
+## Record outcomes after authorized work
+
+Revisit every row after implementing or answering feedback. Report what actually happened, including items deferred or left unchanged:
+
+| Comment | Outcome and evidence | Reviewer reply and thread status |
+| --- | --- | --- |
+| Link to the original comment | Fixed / answered / deferred / no change / blocked; cite code, focused verification, and commit when available | Quote or link the posted reply, or label it **Draft**; report the observed thread status. |
+
+Keep proposed work separate from completed work. If a fix was not verified, state the remaining check. If a reply was posted or a thread was marked resolved, read it back from GitHub before reporting that action as complete. Every original comment must have a disposition and an outcome; do not mark a fix complete from a plan alone.
 
 If the user asked only to analyze or invoked the skill without authorizing changes, stop after the plan and ask which actions to take. If the user has asked to fix feedback or reply to reviewers, carry out that authorized work, verify it, and report the exact threads addressed. Follow repository instructions for any additional approval gate. Post GitHub replies, push, or change review state only when the user's request authorizes those actions.
