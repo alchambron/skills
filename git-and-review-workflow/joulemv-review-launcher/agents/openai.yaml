@@ -1,0 +1,3 @@
+interface:
+  display_name: "JouleMV Review Launcher"
+  short_description: "Pick a pending PR and launch its T3 Code review thread"
