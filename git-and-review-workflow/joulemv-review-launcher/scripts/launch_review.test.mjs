@@ -72,11 +72,12 @@ test('dry run pins PR head without dispatching a thread', async () => {
   assert.equal(result.bootstrap.requireWorktree, true);
   assert.equal(result.bootstrap.startFromOrigin, false);
   assert.match(result.prompt, /\$joulemv-code-review/);
-  assert.match(result.prompt, /If and only if that completed review has at least one verified actionable finding that warrants Request changes/);
-  assert.match(result.prompt, /invoke \$github-inline-review with no arguments in this thread to publish those findings as REQUEST_CHANGES/);
-  assert.match(result.prompt, /If no finding survives validation, or the remaining observations are uncertain, publish no GitHub review or comment/);
+  assert.match(result.prompt, /If it has a verified actionable finding that warrants Request changes, invoke \$github-inline-review with no arguments/);
+  assert.match(result.prompt, /Publish only REQUEST_CHANGES and verify its review and inline comments/);
+  assert.match(result.prompt, /Otherwise invoke \$manual-test-guide for this completed review/);
+  assert.match(result.prompt, /Use preview_status first, preview_open if needed, then preview_\* tools/);
+  assert.match(result.prompt, /save preview_snapshot\(\{save:true\}\) at its observed outcome/);
   assert.match(result.prompt, /Never submit APPROVE or mark the PR approved/);
-  assert.match(result.prompt, /A clean result is "no actionable findings"/);
   assert.deepEqual(calls.posts, []);
   assert.equal(calls.revoked, 1);
   assert.doesNotMatch(JSON.stringify(result), /SECRET_TOKEN/);

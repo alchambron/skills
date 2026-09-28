@@ -375,11 +375,16 @@ function buildPrompt(selected) {
   return `$joulemv-code-review ${selected.url}\n\n${reviewTarget(selected.number, selected.headSha)}\n\n` +
     `Review this PR at the selected head SHA ${selected.headSha}. Confirm the live PR head before reviewing. ` +
     'The worktree starts at this PR head; inspect the complete PR diff against its current base. ' +
-    'Complete and report the read-only $joulemv-code-review first; do not modify files. ' +
-    'If and only if that completed review has at least one verified actionable finding that warrants Request changes, ' +
-    'then invoke $github-inline-review with no arguments in this thread to publish those findings as REQUEST_CHANGES and verify the result. ' +
-    'If no finding survives validation, or the remaining observations are uncertain, publish no GitHub review or comment. ' +
-    'Never submit APPROVE or mark the PR approved. A clean result is "no actionable findings".';
+    'First complete and report the read-only $joulemv-code-review; do not modify files. ' +
+    'If it has a verified actionable finding that warrants Request changes, invoke $github-inline-review with no arguments in this thread. ' +
+    'Publish only REQUEST_CHANGES and verify its review and inline comments. ' +
+    'Otherwise invoke $manual-test-guide for this completed review, then live test every runnable scenario in the T3 Code collaborative browser. ' +
+    'Use preview_status first, preview_open if needed, then preview_* tools; confirm the app serves the reviewed revision before claiming a pass. ' +
+    'For every scenario, report Pass, Fail, or Blocked with expected and actual results, save preview_snapshot({save:true}) at its observed outcome, ' +
+    'and embed the saved picture in the final report. For a blocked scenario without a visible browser state, explain why no picture exists. ' +
+    'If browser testing reveals a reproducible defect in this PR, validate it against the current head, add it as a verified finding to the review, ' +
+    'then use $github-inline-review for REQUEST_CHANGES. ' +
+    'Do not publish uncertain or environment-only findings. Never submit APPROVE or mark the PR approved.';
 }
 
 function buildBootstrapCommand({ project, projectCwd, branch, selected, runtimeMode = 'full-access',
