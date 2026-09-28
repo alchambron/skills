@@ -71,6 +71,7 @@ test('dry run pins PR head without dispatching a thread', async () => {
   assert.equal(result.baseRef, sha);
   assert.equal(result.bootstrap.requireWorktree, true);
   assert.equal(result.bootstrap.startFromOrigin, false);
+  assert.deepEqual(result.modelSelection, { instanceId: 'codex', model: 'gpt-6-sol' });
   assert.match(result.prompt, /\$joulemv-code-review/);
   assert.match(result.prompt, /If it has a verified actionable finding that warrants Request changes, invoke \$github-inline-review with no arguments/);
   assert.match(result.prompt, /Publish only REQUEST_CHANGES and verify its review and inline comments/);
@@ -110,6 +111,8 @@ test('live launch bootstraps at PR SHA, links PR, and verifies readback', async 
     'thread.turn.start', 'thread.pull-request.link',
   ]);
   assert.equal(calls.posts[0].bootstrap.prepareWorktree.baseBranch, sha);
+  assert.deepEqual(calls.posts[0].modelSelection, { instanceId: 'codex', model: 'gpt-6-sol' });
+  assert.deepEqual(calls.posts[0].bootstrap.createThread.modelSelection, { instanceId: 'codex', model: 'gpt-6-sol' });
   assert.equal(calls.posts[0].bootstrap.runSetupScript, false);
   assert.equal(calls.posts[1].repository, 'enerzam/joulemv');
   assert.equal(calls.revoked, 1);

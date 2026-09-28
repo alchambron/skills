@@ -11,6 +11,7 @@ const REPOSITORY = 'EnerZam/JouleMV';
 const REPOSITORY_KEY = REPOSITORY.toLowerCase();
 const PROJECT_CWD = '/Users/alchambron/Documents/Projects/Joule_MV/JouleMV';
 const EXPECTED_BASE_BRANCH = 'work';
+const REVIEW_MODEL_SELECTION = Object.freeze({ instanceId: 'codex', model: 'gpt-6-sol' });
 const SHA_PATTERN = /^[a-f0-9]{40}$/i;
 const REVIEW_KINDS = new Set(['Review', 'Re-review']);
 
@@ -472,10 +473,7 @@ export async function launchReview(options, dependencies = {}) {
         worktreePath: existing.worktreePath, prLinked: hasPrLink(existing, selected.number),
       };
     } else {
-      const modelSelection = project.defaultModelSelection;
-      if (!modelSelection?.instanceId || !modelSelection?.model) {
-        throw new LaunchError('T3_MODEL_UNSET', 'The T3 project has no default model selection.');
-      }
+      const modelSelection = { ...REVIEW_MODEL_SELECTION };
       const selectedWithHead = { ...selected, headRefName: fresh.headRefName };
       const commit = await deps.ensurePrCommit(projectCwd, selected, { dryRun: options.dryRun });
       const command = buildBootstrapCommand({ project, projectCwd, branch, selected: selectedWithHead, modelSelection });

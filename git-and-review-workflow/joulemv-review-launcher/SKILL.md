@@ -30,7 +30,7 @@ node /Users/alchambron/.codex/skills/joulemv-review-launcher/scripts/launch_revi
   --pending-json "$OUTPUT/pending-reviews.json" --pr NUMBER
 ```
 
-The launcher rechecks that each PR is open and still at the picked head before creating anything. On drift, refresh the queue and retry that PR only if it remains a confirmed selection; otherwise report it as skipped. It creates a T3 worktree from the main JouleMV checkout, starts a new T3 thread, links the PR to that thread, and verifies the link. Continue with other selected PRs after an individual failure, but do not blindly retry an uncertain thread creation. A reused thread keeps its original prompt; do not claim the new workflow ran there.
+The launcher rechecks that each PR is open and still at the picked head before creating anything. On drift, refresh the queue and retry that PR only if it remains a confirmed selection; otherwise report it as skipped. It creates a T3 worktree from the main JouleMV checkout, starts a new T3 thread pinned to Codex `gpt-6-sol`, links the PR to that thread, and verifies the link. Continue with other selected PRs after an individual failure, but do not blindly retry an uncertain thread creation. A reused thread keeps its original prompt and model; do not claim the new workflow ran there.
 
 In each new review thread, follow this order:
 
