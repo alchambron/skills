@@ -378,10 +378,15 @@ function buildPrompt(selected) {
     'First complete and report the read-only $joulemv-code-review; do not modify files. ' +
     'If it has a verified actionable finding that warrants Request changes, invoke $github-inline-review with no arguments in this thread. ' +
     'Publish only REQUEST_CHANGES and verify its review and inline comments. ' +
-    'Otherwise invoke $manual-test-guide for this completed review, then live test every runnable scenario in the T3 Code collaborative browser. ' +
-    'Use preview_status first, preview_open if needed, then preview_* tools; confirm the app serves the reviewed revision before claiming a pass. ' +
+    'Otherwise invoke $manual-test-guide for this completed review. From this PR worktree root, run ' +
+    'python3 /Users/alchambron/.codex/skills/joulemv-review-launcher/scripts/agent_run.py doctor, then ' +
+    'python3 /Users/alchambron/.codex/skills/joulemv-review-launcher/scripts/agent_run.py start. ' +
+    'Confirm the returned commit equals the reviewed PR head. Use preview_status first, then preview_open with the returned frontendUrl, ' +
+    'then preview_* tools to live test every runnable guide scenario. ' +
     'For every scenario, report Pass, Fail, or Blocked with expected and actual results, save preview_snapshot({save:true}) at its observed outcome, ' +
     'and embed the saved picture in the final report. For a blocked scenario without a visible browser state, explain why no picture exists. ' +
+    'If startup fails, report the CLI message and logs path. Run ' +
+    'python3 /Users/alchambron/.codex/skills/joulemv-review-launcher/scripts/agent_run.py stop after browser testing. ' +
     'If browser testing reveals a reproducible defect in this PR, validate it against the current head, add it as a verified finding to the review, ' +
     'then use $github-inline-review for REQUEST_CHANGES. ' +
     'Do not publish uncertain or environment-only findings. Never submit APPROVE or mark the PR approved.';
