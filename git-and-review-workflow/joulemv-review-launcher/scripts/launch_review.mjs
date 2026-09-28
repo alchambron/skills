@@ -377,21 +377,25 @@ function buildPrompt(selected) {
     `Review this PR at the selected head SHA ${selected.headSha}. Confirm the live PR head before reviewing. ` +
     'The worktree starts at this PR head; inspect the complete PR diff against its current base. ' +
     'First complete and report the read-only $joulemv-code-review; do not modify files. ' +
-    'If it has a verified actionable finding that warrants Request changes, invoke $github-inline-review with no arguments in this thread. ' +
-    'Publish only REQUEST_CHANGES and verify its review and inline comments. ' +
-    'Otherwise invoke $manual-test-guide for this completed review. From this PR worktree root, run ' +
+    'Choose exactly one branch after the review. If it reports any verified actionable defect, invoke $github-inline-review with no arguments, ' +
+    'publish only REQUEST_CHANGES, verify its review and inline comments, then STOP this thread. If publication fails, report that and still STOP. ' +
+    'In this finding branch, do not invoke $manual-test-guide, start the app, or open a browser. ' +
+    'Only when there are no verified actionable findings, invoke $manual-test-guide for this completed review. From this PR worktree root, run ' +
     'python3 /Users/alchambron/.codex/skills/joulemv-review-launcher/scripts/agent_run.py doctor, then ' +
     'python3 /Users/alchambron/.codex/skills/joulemv-review-launcher/scripts/agent_run.py start. ' +
-    'Confirm the returned commit equals the reviewed PR head. Use preview_status first, then preview_open with the returned frontendUrl, ' +
+    'Confirm start returned ok true and status ready or already_ready, and the returned commit equals the reviewed PR head. ' +
+    'If startup fails, report the CLI message and logs path; do not open the browser or capture a blank frame. ' +
+    'After a successful start, use preview_status first, then preview_open with the returned frontendUrl, ' +
     'then preview_* tools to live test every runnable guide scenario. ' +
     'For every scenario, report Pass, Fail, or Blocked with expected and actual results, save preview_snapshot({save:true}) at its observed outcome, ' +
-    'and embed the saved picture in the final report. For a blocked scenario without a visible browser state, explain why no picture exists. ' +
+    'inspect the saved image, and embed it in the final report. If the image is blank while page text exists, wait for rendering and retry the snapshot. ' +
+    'For a blocked scenario without a visible browser state, explain why no picture exists; never embed an empty frame. ' +
     'The CLI replays versioned tenant migrations in its database clone, but does not recreate root seed data; report missing root fixtures as a test gap. ' +
-    'If startup fails, report the CLI message and logs path. After any start attempt, including failure or early exit, run ' +
+    'After any start attempt, including failure or early exit, run ' +
     'python3 /Users/alchambron/.codex/skills/joulemv-review-launcher/scripts/agent_run.py stop before your final reply. ' +
     'Verify databaseDropped true or already_stopped; report any cleanup error. Abandoned runs expire after two hours. ' +
-    'If browser testing reveals a reproducible defect in this PR, validate it against the current head, add it as a verified finding to the review, ' +
-    'then use $github-inline-review for REQUEST_CHANGES. ' +
+    'If browser testing reveals a reproducible defect in this PR, stop further scenarios, validate it against the current head, ' +
+    'add it as a verified finding to the review, then use $github-inline-review for REQUEST_CHANGES and STOP. ' +
     'Do not publish uncertain or environment-only findings. Never submit APPROVE or mark the PR approved.';
 }
 

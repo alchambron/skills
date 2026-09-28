@@ -113,22 +113,36 @@ def pg_tools():
 
 
 def java_env():
+    pom = (ROOT / "pom.xml").read_text(encoding="utf-8")
+    target = re.search(r"<java.version>\s*(\d+)\s*</java.version>", pom)
+    if not target:
+        raise LaunchError("pom.xml has no supported java.version property")
+    version_number = target.group(1)
     result = os.environ.copy()
-    candidates = [result.get("JAVA_HOME", "")]
+    candidates = [result["JAVA_HOME"]] if result.get("JAVA_HOME") else []
     if shutil.which("brew"):
-        prefix = subprocess.run(["brew", "--prefix", "openjdk@25"], capture_output=True, text=True)
+        prefix = subprocess.run(["brew", "--prefix", "openjdk@" + version_number], capture_output=True, text=True)
         if prefix.returncode == 0:
             candidates.append(str(Path(prefix.stdout.strip()) / "libexec/openjdk.jdk/Contents/Home"))
+    if Path("/usr/libexec/java_home").is_file():
+        selected = subprocess.run(["/usr/libexec/java_home", "-v", version_number], capture_output=True, text=True)
+        if selected.returncode == 0:
+            candidates.append(selected.stdout.strip())
+    installed_java = shutil.which("java")
+    if installed_java:
+        inferred_home = Path(installed_java).resolve().parent.parent
+        if inferred_home != Path("/usr"):
+            candidates.append(str(inferred_home))
     for home in candidates:
-        java = Path(home) / "bin/java" if home else Path(shutil.which("java") or "")
+        java = Path(home) / "bin/java"
         if java.is_file():
-            version = subprocess.run([str(java), "-version"], capture_output=True, text=True)
-            if re.search(r'version "25(?:\.|\")', version.stderr):
-                if home:
-                    result["JAVA_HOME"] = home
-                    result["PATH"] = str(Path(home) / "bin") + os.pathsep + result.get("PATH", "")
+            version = subprocess.run([str(java), "-version"], capture_output=True, text=True, timeout=5)
+            if re.search(r'version "' + re.escape(version_number) + r'(?:\.|\")', version.stderr):
+                result["JAVA_HOME"] = home
+                result["PATH"] = str(Path(home) / "bin") + os.pathsep + result.get("PATH", "")
                 return result
-    raise LaunchError("Java 25 is required (install openjdk@25 or set JAVA_HOME)")
+    raise LaunchError("Java %s is required by this branch (install openjdk@%s or set JAVA_HOME)" %
+                      (version_number, version_number))
 
 
 def preflight():
@@ -317,6 +331,11 @@ def stop_process(pid, stamp=None):
         os.killpg(pid, signal.SIGTERM)
     except ProcessLookupError:
         return
+    except PermissionError:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
     for _ in range(50):
         if not alive(pid, stamp):
             return
@@ -325,6 +344,11 @@ def stop_process(pid, stamp=None):
         os.killpg(pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
+    except PermissionError:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
 
 
 def lock_state():
@@ -332,6 +356,19 @@ def lock_state():
     handle = open(STATE_DIR / ".lock", "a+")
     fcntl.flock(handle, fcntl.LOCK_EX)
     return handle
+
+
+def build_backend(java):
+    pom = (ROOT / "pom.xml").read_text(encoding="utf-8")
+    final_name = re.search(r"<finalName>\s*([A-Za-z0-9_.-]+)\s*</finalName>", pom)
+    if not final_name:
+        raise LaunchError("pom.xml has no simple build finalName")
+    run(["mvn", "-q", "-Dmaven.test.skip=true", "package"], env=java,
+        log=STATE_DIR / "backend.log", timeout=600)
+    artifact = ROOT / "target" / (final_name.group(1) + ".war")
+    if not artifact.is_file():
+        raise LaunchError("Backend build did not produce %s" % artifact)
+    return artifact
 
 
 def start(timeout, max_runtime_minutes):
@@ -351,9 +388,9 @@ def start(timeout, max_runtime_minutes):
             raise LaunchError("Previous agent run is incomplete; inspect status and run stop before retrying")
         values, source, tools, java, size = preflight()
         modules = prepare_frontend()
+        artifact = build_backend(java)
         offset = int(KEY[:8], 16) % 40
         backend_port = choose_port(8100 + offset, os.environ.get("JMV_BACKEND_PORT"))
-        debug_port = choose_port(8300 + offset, os.environ.get("JMV_DEBUG_PORT"))
         frontend_port = choose_port(5200 + offset, os.environ.get("JMV_FRONTEND_PORT"))
         backend_url = "http://127.0.0.1:%s" % backend_port
         frontend_url = "http://127.0.0.1:%s" % frontend_port
@@ -380,7 +417,7 @@ def start(timeout, max_runtime_minutes):
             frontend_env = {**os.environ, **values, "VITE_API_URL": backend_url,
                             "VITE_LEGACY_API_URL": backend_url, "VITE_SENTRY_DSN": ""}
             with open(STATE_DIR / "backend.log", "a", encoding="utf-8") as be_log:
-                backend = subprocess.Popen(["mvn", "-q", "spring-boot:run", "-Djmv.debug.port=%s" % debug_port],
+                backend = subprocess.Popen([str(Path(java["JAVA_HOME"]) / "bin/java"), "-jar", str(artifact)],
                                            cwd=ROOT, env=app_env, stdout=be_log, stderr=subprocess.STDOUT,
                                            start_new_session=True)
             state["backendPid"] = backend.pid
@@ -417,13 +454,19 @@ def start(timeout, max_runtime_minutes):
                 time.sleep(2)
             raise LaunchError("Timed out waiting for backend /login and frontend /; see logs in %s" % STATE_DIR)
         except Exception as startup_error:
-            stop_process(state.get("backendPid"), state.get("backendStamp"))
-            stop_process(state.get("frontendPid"), state.get("frontendStamp"))
+            cleanup_errors = []
+            for role in ("backend", "frontend"):
+                try:
+                    stop_process(state.get(role + "Pid"), state.get(role + "Stamp"))
+                except OSError as exc:
+                    cleanup_errors.append("%s process: %s" % (role, exc))
             try:
                 drop_agent_db(state, values, source, tools)
             except Exception as cleanup_error:
-                raise LaunchError("Startup failed: %s; database cleanup failed: %s; state retained for retry" %
-                                  (startup_error, cleanup_error)) from cleanup_error
+                cleanup_errors.append("database: %s" % cleanup_error)
+            if cleanup_errors:
+                raise LaunchError("Startup failed: %s; cleanup failed: %s; state retained for retry" %
+                                  (startup_error, "; ".join(cleanup_errors))) from startup_error
             STATE_FILE.unlink(missing_ok=True)
             raise
 
