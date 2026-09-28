@@ -100,6 +100,7 @@ test('dry run pins the fetched origin/work snapshot without dispatching a thread
   assert.match(result.prompt, /Verify databaseDropped true or already_stopped/);
   assert.match(result.prompt, /save preview_snapshot\(\{save:true\}\) at its observed outcome/);
   assert.match(result.prompt, /inspect the saved image/);
+  assert.match(result.prompt, /blank, blurred, or clips the observed result/);
   assert.match(result.prompt, /never embed an empty frame/);
   assert.match(result.prompt, /Never submit APPROVE or mark the PR approved/);
   assert.deepEqual(calls.posts, []);

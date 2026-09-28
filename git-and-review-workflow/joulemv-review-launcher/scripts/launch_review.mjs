@@ -429,7 +429,7 @@ function buildPrompt(selected, baseSha) {
     'After a successful start, use preview_status first, then preview_open with the returned frontendUrl, ' +
     'then preview_* tools to live test every runnable guide scenario. ' +
     'For every scenario, report Pass, Fail, or Blocked with expected and actual results, save preview_snapshot({save:true}) at its observed outcome, ' +
-    'inspect the saved image, and embed it in the final report. If the image is blank while page text exists, wait for rendering and retry the snapshot. ' +
+    'inspect the saved image, and embed it in the final report. If the image is blank, blurred, or clips the observed result while page text exists, wait for rendering or resize the preview and retry the snapshot until the result is legible. ' +
     'For a blocked scenario without a visible browser state, explain why no picture exists; never embed an empty frame. ' +
     'The CLI replays versioned tenant migrations in its database clone, but does not recreate root seed data; report missing root fixtures as a test gap. ' +
     'After any start attempt, including failure or early exit, run this from the test worktree: ' +
