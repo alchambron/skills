@@ -385,8 +385,10 @@ function buildPrompt(selected) {
     'then preview_* tools to live test every runnable guide scenario. ' +
     'For every scenario, report Pass, Fail, or Blocked with expected and actual results, save preview_snapshot({save:true}) at its observed outcome, ' +
     'and embed the saved picture in the final report. For a blocked scenario without a visible browser state, explain why no picture exists. ' +
-    'If startup fails, report the CLI message and logs path. Run ' +
-    'python3 /Users/alchambron/.codex/skills/joulemv-review-launcher/scripts/agent_run.py stop after browser testing. ' +
+    'The CLI replays versioned tenant migrations in its database clone, but does not recreate root seed data; report missing root fixtures as a test gap. ' +
+    'If startup fails, report the CLI message and logs path. After any start attempt, including failure or early exit, run ' +
+    'python3 /Users/alchambron/.codex/skills/joulemv-review-launcher/scripts/agent_run.py stop before your final reply. ' +
+    'Verify databaseDropped true or already_stopped; report any cleanup error. Abandoned runs expire after two hours. ' +
     'If browser testing reveals a reproducible defect in this PR, validate it against the current head, add it as a verified finding to the review, ' +
     'then use $github-inline-review for REQUEST_CHANGES. ' +
     'Do not publish uncertain or environment-only findings. Never submit APPROVE or mark the PR approved.';

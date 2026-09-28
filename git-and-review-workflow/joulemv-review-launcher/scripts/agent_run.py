@@ -18,6 +18,7 @@ import socket
 import subprocess
 import sys
 import time
+from uuid import uuid4
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import urlopen
@@ -333,7 +334,7 @@ def lock_state():
     return handle
 
 
-def start(timeout):
+def start(timeout, max_runtime_minutes):
     with lock_state():
         existing = read_state()
         if existing:
@@ -342,7 +343,10 @@ def start(timeout):
             if alive(existing.get("backendPid"), existing.get("backendStamp")) and \
                     alive(existing.get("frontendPid"), existing.get("frontendStamp")) and \
                     http_ready(existing["backendUrl"] + "/login") and http_ready(existing["frontendUrl"]):
-                output(ok=True, status="already_ready", **{k: existing[k] for k in ("frontendUrl", "backendUrl", "commit", "dbName")})
+                existing["expiresAt"] = time.time() + max_runtime_minutes * 60
+                write_state(existing)
+                output(ok=True, status="already_ready", expiresAt=existing["expiresAt"],
+                       **{k: existing[k] for k in ("frontendUrl", "backendUrl", "commit", "dbName")})
                 return
             raise LaunchError("Previous agent run is incomplete; inspect status and run stop before retrying")
         values, source, tools, java, size = preflight()
@@ -357,7 +361,8 @@ def start(timeout):
         state = {"owner": "joulemv-agent-run", "repo": str(ROOT), "commit": commit,
                  "dbName": "jmv_ai_" + KEY, "backendUrl": backend_url,
                  "frontendUrl": frontend_url, "backendPid": None, "frontendPid": None,
-                 "dbCreated": False, "phase": "cloning", "createdAt": time.time()}
+                 "dbCreated": False, "phase": "cloning", "createdAt": time.time(),
+                 "runId": uuid4().hex}
         write_state(state)
         try:
             tenant_count = create_agent_db(state, values, source, tools)
@@ -396,11 +401,17 @@ def start(timeout):
                     raise LaunchError("A server exited during startup; see backend.log and frontend.log")
                 if http_ready(backend_url + "/login") and http_ready(frontend_url):
                     state["phase"] = "ready"
+                    state["expiresAt"] = time.time() + max_runtime_minutes * 60
                     write_state(state)
+                    with open(STATE_DIR / "watchdog.log", "a", encoding="utf-8") as watch_log:
+                        subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "_watchdog", state["runId"]],
+                                         cwd=ROOT, stdout=watch_log, stderr=subprocess.STDOUT,
+                                         start_new_session=True)
                     output(ok=True, status="ready", frontendUrl=frontend_url,
                            backendUrl=backend_url, commit=commit, dbIsolation="clone",
                            dbName=state["dbName"], sourceSizeMiB=size,
-                           migratedTenants=tenant_count, frontendDependencies=modules,
+                           tenantSchemasProcessed=tenant_count, frontendDependencies=modules,
+                           expiresAt=state["expiresAt"],
                            logs=str(STATE_DIR))
                     return
                 time.sleep(2)
@@ -428,15 +439,17 @@ def status():
     output(ok=ready, status="ready" if ready else "unhealthy",
            backendReady=backend, frontendReady=frontend,
            frontendUrl=state["frontendUrl"], backendUrl=state["backendUrl"],
-           commit=state["commit"], logs=str(STATE_DIR))
+           commit=state["commit"], expiresAt=state.get("expiresAt"), logs=str(STATE_DIR))
     return 0 if ready else 1
 
 
-def stop():
+def stop(expected_run_id=None):
     with lock_state():
         state = read_state()
         if not state:
             output(ok=True, status="already_stopped")
+            return
+        if expected_run_id and state.get("runId") != expected_run_id:
             return
         stop_process(state.get("backendPid"), state.get("backendStamp"))
         stop_process(state.get("frontendPid"), state.get("frontendStamp"))
@@ -448,25 +461,47 @@ def stop():
         output(ok=True, status="stopped", databaseDropped=True)
 
 
+def watchdog(run_id):
+    while True:
+        state = read_state()
+        if not state or state.get("runId") != run_id:
+            return
+        expired = time.time() >= state["expiresAt"]
+        server_exited = not alive(state.get("backendPid"), state.get("backendStamp")) or \
+            not alive(state.get("frontendPid"), state.get("frontendStamp"))
+        if expired or server_exited:
+            try:
+                stop(expected_run_id=run_id)
+                return
+            except (LaunchError, OSError, subprocess.TimeoutExpired) as exc:
+                print("Cleanup retry after failure: %s" % exc, flush=True)
+        time.sleep(30)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("doctor")
     start_parser = sub.add_parser("start")
     start_parser.add_argument("--timeout", type=int, default=600)
+    start_parser.add_argument("--max-runtime-minutes", type=float, default=120)
     sub.add_parser("status")
     sub.add_parser("stop")
+    watch_parser = sub.add_parser("_watchdog", help=argparse.SUPPRESS)
+    watch_parser.add_argument("run_id")
     args = parser.parse_args()
     try:
         if args.command == "doctor":
             _, _, _, _, size = preflight()
             output(ok=True, status="ready_to_start", worktree=str(ROOT), sourceSizeMiB=size)
         elif args.command == "start":
-            if args.timeout <= 0:
-                raise LaunchError("--timeout must be positive")
-            start(args.timeout)
+            if args.timeout <= 0 or not 0.1 <= args.max_runtime_minutes <= 1440:
+                raise LaunchError("--timeout must be positive and --max-runtime-minutes must be between 0.1 and 1440")
+            start(args.timeout, args.max_runtime_minutes)
         elif args.command == "status":
             return status()
+        elif args.command == "_watchdog":
+            watchdog(args.run_id)
         else:
             stop()
     except (LaunchError, OSError, subprocess.TimeoutExpired, ValueError, json.JSONDecodeError) as exc:

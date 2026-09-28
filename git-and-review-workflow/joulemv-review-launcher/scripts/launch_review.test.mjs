@@ -78,7 +78,9 @@ test('dry run pins PR head without dispatching a thread', async () => {
   assert.match(result.prompt, /agent_run\.py doctor, then python3 \/Users\/alchambron\/\.codex\/skills\/joulemv-review-launcher\/scripts\/agent_run\.py start/);
   assert.match(result.prompt, /Confirm the returned commit equals the reviewed PR head/);
   assert.match(result.prompt, /Use preview_status first, then preview_open with the returned frontendUrl/);
-  assert.match(result.prompt, /agent_run\.py stop after browser testing/);
+  assert.match(result.prompt, /After any start attempt, including failure or early exit, run/);
+  assert.match(result.prompt, /agent_run\.py stop before your final reply/);
+  assert.match(result.prompt, /Verify databaseDropped true or already_stopped/);
   assert.match(result.prompt, /save preview_snapshot\(\{save:true\}\) at its observed outcome/);
   assert.match(result.prompt, /Never submit APPROVE or mark the PR approved/);
   assert.deepEqual(calls.posts, []);
