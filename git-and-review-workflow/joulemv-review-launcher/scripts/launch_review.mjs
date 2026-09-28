@@ -105,7 +105,7 @@ async function runProcess(command, args, { timeoutMs = 30_000 } = {}) {
 async function freshPullRequest(number) {
   const output = await runProcess('gh', [
     'pr', 'view', String(number), '--repo', REPOSITORY,
-    '--json', 'number,url,headRefOid,headRefName,state,isDraft',
+    '--json', 'number,url,headRefOid,headRefName,baseRefName,state,isDraft',
   ]);
   let pr;
   try {
@@ -114,18 +114,35 @@ async function freshPullRequest(number) {
     throw new LaunchError('INVALID_GITHUB_RESPONSE', 'GitHub returned invalid PR data.');
   }
   if (pr.number !== number || pr.url !== canonicalPrUrl(number)
-    || !SHA_PATTERN.test(pr.headRefOid ?? '') || !pr.headRefName) {
+    || !SHA_PATTERN.test(pr.headRefOid ?? '') || !pr.headRefName || !pr.baseRefName) {
     throw new LaunchError('INVALID_GITHUB_RESPONSE', `GitHub returned unexpected data for PR #${number}.`);
   }
   return pr;
 }
 
-async function baseBranch(projectCwd) {
-  const branch = (await runProcess('git', ['-C', projectCwd, 'branch', '--show-current'])).trim();
-  if (branch !== EXPECTED_BASE_BRANCH) {
-    throw new LaunchError('WRONG_BASE_BRANCH', `Primary checkout must be on ${EXPECTED_BASE_BRANCH}; found ${branch || 'detached HEAD'}.`);
+async function originWorkCommit(projectCwd, { dryRun = false } = {}) {
+  const remote = (await runProcess('git', ['-C', projectCwd, 'remote', 'get-url', 'origin'])).trim();
+  if (!/^(?:git@github\.com:|https:\/\/github\.com\/|ssh:\/\/git@github\.com\/)(?:EnerZam\/JouleMV)(?:\.git)?$/i.test(remote)) {
+    throw new LaunchError('WRONG_GIT_REMOTE', 'The primary checkout origin is not EnerZam/JouleMV.');
   }
-  return branch;
+  const ref = `refs/heads/${EXPECTED_BASE_BRANCH}`;
+  const output = (await runProcess('git', ['-C', projectCwd, 'ls-remote', '--exit-code', 'origin', ref], {
+    timeoutMs: 60_000,
+  })).trim();
+  const sha = output.split(/\s+/)[0]?.toLowerCase();
+  if (!SHA_PATTERN.test(sha ?? '') || !output.endsWith(ref)) {
+    throw new LaunchError('ORIGIN_WORK_UNAVAILABLE', `Cannot verify origin/${EXPECTED_BASE_BRANCH}.`);
+  }
+  if (!dryRun) {
+    await runProcess('git', ['-C', projectCwd, 'fetch', '--no-tags', 'origin',
+      `+${ref}:refs/remotes/origin/${EXPECTED_BASE_BRANCH}`], { timeoutMs: 180_000 });
+    const fetched = (await runProcess('git', ['-C', projectCwd, 'rev-parse',
+      `refs/remotes/origin/${EXPECTED_BASE_BRANCH}^{commit}`])).trim().toLowerCase();
+    if (fetched !== sha) {
+      throw new LaunchError('ORIGIN_WORK_MOVED', `origin/${EXPECTED_BASE_BRANCH} moved during launch. Retry with a fresh base.`);
+    }
+  }
+  return { branch: EXPECTED_BASE_BRANCH, sha };
 }
 
 async function ensurePrCommit(projectCwd, selected, { dryRun = false } = {}) {
@@ -329,6 +346,14 @@ function hasTargetMarker(thread, marker) {
   return thread.messages?.some((message) => message.role === 'user' && message.text?.includes(marker)) ?? false;
 }
 
+function hasVerifiedSetup(thread, baseSha, expectedBranch) {
+  const setup = thread.activities?.find((activity) => activity.kind === 'worktree-setup'
+    && activity.payload?.phase === 'done');
+  return Boolean(setup && setup.payload.baseRef?.toLowerCase() === baseSha.toLowerCase()
+    && setup.payload.worktreePath === thread.worktreePath
+    && thread.branch === expectedBranch);
+}
+
 async function findExistingReview(api, shell, projectId, number, sha) {
   const marker = reviewTarget(number, sha);
   const candidates = shell.threads.filter((thread) => thread.projectId === projectId
@@ -341,14 +366,21 @@ async function findExistingReview(api, shell, projectId, number, sha) {
   return null;
 }
 
-async function verifyWorktree(projectCwd, worktreePath) {
-  if (!worktreePath) return false;
+async function verifyWorktree(projectCwd, worktreePath, baseSha, expectedBranch) {
+  if (!worktreePath || !SHA_PATTERN.test(baseSha ?? '') || !expectedBranch) return false;
   try {
     if (!(await stat(worktreePath)).isDirectory()) return false;
     const target = await realpath(worktreePath);
     const porcelain = await runProcess('git', ['-C', projectCwd, 'worktree', 'list', '--porcelain']);
-    return porcelain.split('\n').some((line) => line.startsWith('worktree ')
+    const registered = porcelain.split('\n').some((line) => line.startsWith('worktree ')
       && path.resolve(line.slice('worktree '.length)) === target);
+    if (!registered) return false;
+    const [head, branch] = await Promise.all([
+      runProcess('git', ['-C', target, 'rev-parse', 'HEAD']),
+      runProcess('git', ['-C', target, 'branch', '--show-current']),
+    ]);
+    return head.trim().toLowerCase() === baseSha.toLowerCase()
+      && branch.trim() === expectedBranch;
   } catch {
     return false;
   }
@@ -372,18 +404,23 @@ async function waitForThread(api, threadId, { timeoutMs = 60_000, requireReady =
   return lastThread;
 }
 
-function buildPrompt(selected) {
+function buildPrompt(selected, baseSha) {
   return `$joulemv-code-review ${selected.url}\n\n${reviewTarget(selected.number, selected.headSha)}\n\n` +
+    `This worktree must start at origin/work commit ${baseSha}. Before any review, verify git rev-parse HEAD equals that commit; stop and report a base mismatch otherwise. ` +
     `Review this PR at the selected head SHA ${selected.headSha}. Confirm the live PR head before reviewing. ` +
-    'The worktree starts at this PR head; inspect the complete PR diff against its current base. ' +
+    'Inspect the complete PR diff against its current base without checking out the PR head. ' +
     'First complete and report the read-only $joulemv-code-review; do not modify files. ' +
     'Choose exactly one branch after the review. If it reports any verified actionable defect, invoke $github-inline-review with no arguments, ' +
     'publish only REQUEST_CHANGES, verify its review and inline comments, then STOP this thread. If publication fails, report that and still STOP. ' +
     'In this finding branch, do not invoke $manual-test-guide, start the app, or open a browser. ' +
-    'Only when there are no verified actionable findings, invoke $manual-test-guide for this completed review. From this PR worktree root, run ' +
+    `Only when there are no verified actionable findings, invoke $manual-test-guide for this completed review. ` +
+    `For browser testing, first verify HEAD is still ${baseSha} and the worktree is clean. Merge the pinned PR head ${selected.headSha} ` +
+    'into this isolated branch with git merge --no-ff --no-edit. If it conflicts, run git merge --abort, mark live scenarios Blocked, and stop without starting the app. ' +
+    `Require git rev-list --parents -n 1 HEAD to show exactly two parents, first ${baseSha} and second ${selected.headSha}; ` +
+    'record this integration commit as the tested revision. If that check fails, stop without starting the app. From this worktree root, run ' +
     'python3 /Users/alchambron/.codex/skills/joulemv-review-launcher/scripts/agent_run.py doctor, then ' +
     'python3 /Users/alchambron/.codex/skills/joulemv-review-launcher/scripts/agent_run.py start. ' +
-    'Confirm start returned ok true and status ready or already_ready, and the returned commit equals the reviewed PR head. ' +
+    'Confirm start returned ok true and status ready or already_ready, and the returned commit equals the verified integration commit. ' +
     'If startup fails, report the CLI message and logs path; do not open the browser or capture a blank frame. ' +
     'After a successful start, use preview_status first, then preview_open with the returned frontendUrl, ' +
     'then preview_* tools to live test every runnable guide scenario. ' +
@@ -399,24 +436,26 @@ function buildPrompt(selected) {
     'Do not publish uncertain or environment-only findings. Never submit APPROVE or mark the PR approved.';
 }
 
-function buildBootstrapCommand({ project, projectCwd, branch, selected, runtimeMode = 'full-access',
+function buildBootstrapCommand({ project, projectCwd, base, selected, runtimeMode = 'full-access',
   interactionMode = 'default', modelSelection, ids = {} }) {
   const threadId = ids.threadId ?? randomUUID();
   const commandId = ids.commandId ?? randomUUID();
   const messageId = ids.messageId ?? randomUUID();
   const createdAt = new Date().toISOString();
   const title = `Review PR #${selected.number} @${selected.headSha.slice(0, 12)}`;
+  const reviewBranch = `t3-review-pr-${selected.number}-${threadId}`;
   return {
     type: 'thread.turn.start', commandId, threadId,
-    message: { messageId, role: 'user', text: buildPrompt(selected), attachments: [] },
+    message: { messageId, role: 'user', text: buildPrompt(selected, base.sha), attachments: [] },
     modelSelection, titleSeed: title, runtimeMode, interactionMode,
     bootstrap: {
       createThread: {
         projectId: project.id, title, modelSelection, runtimeMode, interactionMode,
-        branch: selected.headRefName, worktreePath: null, createdAt,
+        branch: reviewBranch, worktreePath: null, createdAt,
       },
       prepareWorktree: {
-        projectCwd, baseBranch: selected.headSha, startFromOrigin: false, requireWorktree: true,
+        projectCwd, baseBranch: base.sha, branch: reviewBranch,
+        startFromOrigin: false, requireWorktree: true,
       },
       runSetupScript: false,
     },
@@ -436,7 +475,7 @@ export async function launchReview(options, dependencies = {}) {
   const deps = {
     readPending: async (file) => JSON.parse(await readFile(file, 'utf8')),
     freshPullRequest,
-    baseBranch,
+    originWorkCommit,
     ensurePrCommit,
     discoverRuntime,
     issueSession,
@@ -457,7 +496,9 @@ export async function launchReview(options, dependencies = {}) {
   if (fresh.state !== 'OPEN' || fresh.isDraft) {
     throw new LaunchError('PR_NOT_REVIEWABLE', `PR #${selected.number} is no longer an open, non-draft PR.`);
   }
-  const branch = await deps.baseBranch(projectCwd);
+  if (fresh.baseRefName !== EXPECTED_BASE_BRANCH) {
+    throw new LaunchError('WRONG_PR_BASE', `PR #${selected.number} targets ${fresh.baseRefName}; expected ${EXPECTED_BASE_BRANCH}.`);
+  }
   const runtime = await deps.discoverRuntime();
   const session = await deps.issueSession(runtime);
   let result;
@@ -477,13 +518,13 @@ export async function launchReview(options, dependencies = {}) {
         worktreePath: existing.worktreePath, prLinked: hasPrLink(existing, selected.number),
       };
     } else {
+      const base = await deps.originWorkCommit(projectCwd, { dryRun: options.dryRun });
       const modelSelection = { ...REVIEW_MODEL_SELECTION };
-      const selectedWithHead = { ...selected, headRefName: fresh.headRefName };
       const commit = await deps.ensurePrCommit(projectCwd, selected, { dryRun: options.dryRun });
-      const command = buildBootstrapCommand({ project, projectCwd, branch, selected: selectedWithHead, modelSelection });
+      const command = buildBootstrapCommand({ project, projectCwd, base, selected, modelSelection });
       const summary = {
         pr: selected.number, headSha: selected.headSha, projectId: project.id,
-        baseBranch: branch, baseRef: selected.headSha, modelSelection, threadId: command.threadId,
+        baseBranch: base.branch, baseRef: base.sha, modelSelection, threadId: command.threadId,
         threadUrl: threadUrl(runtime, command.threadId),
       };
       if (options.dryRun) {
@@ -526,14 +567,20 @@ export async function launchReview(options, dependencies = {}) {
         }
         const linkedThread = await waitForThread(api, command.threadId);
         const prLinked = linkedThread ? hasPrLink(linkedThread, selected.number) : false;
-        const worktreeVerified = await deps.verifyWorktree(projectCwd, thread.worktreePath);
-        const promptVerified = hasTargetMarker(thread, reviewTarget(selected.number, selected.headSha));
-        if (!worktreeVerified || !promptVerified) {
+        const confirmedThread = linkedThread ?? thread;
+        const worktreeVerified = await deps.verifyWorktree(projectCwd, confirmedThread.worktreePath,
+          base.sha, command.bootstrap.prepareWorktree.branch);
+        const setupVerified = hasVerifiedSetup(confirmedThread, base.sha,
+          command.bootstrap.prepareWorktree.branch);
+        const promptVerified = hasTargetMarker(confirmedThread, reviewTarget(selected.number, selected.headSha));
+        if (!worktreeVerified || !setupVerified || !promptVerified) {
           result = { ok: false, status: 'launch_incomplete', ...summary,
-            worktreePath: thread.worktreePath, worktreeVerified, promptVerified, prLinked };
+            worktreePath: confirmedThread.worktreePath, worktreeVerified, setupVerified,
+            promptVerified, prLinked };
         } else {
           result = { ok: prLinked, status: prLinked ? 'launched' : 'thread_created_link_failed',
-            ...summary, worktreePath: thread.worktreePath, worktreeVerified, promptVerified, prLinked,
+            ...summary, worktreePath: confirmedThread.worktreePath, worktreeVerified, setupVerified,
+            promptVerified, prLinked,
             ...(prLinked || !linkError ? {} : { linkError }),
           };
         }
