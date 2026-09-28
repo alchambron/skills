@@ -415,12 +415,16 @@ function buildPrompt(selected, baseSha) {
     'In this finding branch, do not invoke $manual-test-guide, start the app, or open a browser. ' +
     `Only when there are no verified actionable findings, invoke $manual-test-guide for this completed review. ` +
     `For browser testing, first verify HEAD is still ${baseSha} and the worktree is clean. Merge the pinned PR head ${selected.headSha} ` +
-    'into this isolated branch with git merge --no-ff --no-edit. If it conflicts, run git merge --abort, mark live scenarios Blocked, and stop without starting the app. ' +
-    `Require git rev-list --parents -n 1 HEAD to show exactly two parents, first ${baseSha} and second ${selected.headSha}; ` +
-    'record this integration commit as the tested revision. If that check fails, stop without starting the app. From this worktree root, run ' +
+    'into this isolated branch with git merge --no-ff --no-edit. If it succeeds, ' +
+    `require git rev-list --parents -n 1 HEAD to show exactly two parents, first ${baseSha} and second ${selected.headSha}; ` +
+    'record that integration commit as the tested revision. If that check fails, stop without starting the app. ' +
+    'If the merge conflicts, run git merge --abort and keep this T3 worktree at the pinned origin/work commit. ' +
+    `Use git worktree add --detach at a unique path outside the T3 worktree for ${selected.headSha}, verify its HEAD, and live test from there as PR-head-only coverage. ` +
+    'Report that integration with current origin/work remains unverified; do not resolve semantic conflicts automatically or call this an integrated test. ' +
+    'From the verified integration or PR-head-only test worktree root, run ' +
     'python3 /Users/alchambron/.codex/skills/joulemv-review-launcher/scripts/agent_run.py doctor, then ' +
     'python3 /Users/alchambron/.codex/skills/joulemv-review-launcher/scripts/agent_run.py start. ' +
-    'Confirm start returned ok true and status ready or already_ready, and the returned commit equals the verified integration commit. ' +
+    'Confirm start returned ok true and status ready or already_ready, and the returned commit equals the verified integration commit or pinned PR head for the chosen test path. ' +
     'If startup fails, report the CLI message and logs path; do not open the browser or capture a blank frame. ' +
     'After a successful start, use preview_status first, then preview_open with the returned frontendUrl, ' +
     'then preview_* tools to live test every runnable guide scenario. ' +
@@ -428,9 +432,9 @@ function buildPrompt(selected, baseSha) {
     'inspect the saved image, and embed it in the final report. If the image is blank while page text exists, wait for rendering and retry the snapshot. ' +
     'For a blocked scenario without a visible browser state, explain why no picture exists; never embed an empty frame. ' +
     'The CLI replays versioned tenant migrations in its database clone, but does not recreate root seed data; report missing root fixtures as a test gap. ' +
-    'After any start attempt, including failure or early exit, run ' +
+    'After any start attempt, including failure or early exit, run this from the test worktree: ' +
     'python3 /Users/alchambron/.codex/skills/joulemv-review-launcher/scripts/agent_run.py stop before your final reply. ' +
-    'Verify databaseDropped true or already_stopped; report any cleanup error. Abandoned runs expire after two hours. ' +
+    'Verify databaseDropped true or already_stopped; report any cleanup error. Remove a disposable PR-head worktree only after cleanup succeeds. Abandoned runs expire after two hours. ' +
     'If browser testing reveals a reproducible defect in this PR, stop further scenarios, validate it against the current head, ' +
     'add it as a verified finding to the review, then use $github-inline-review for REQUEST_CHANGES and STOP. ' +
     'Do not publish uncertain or environment-only findings. Never submit APPROVE or mark the PR approved.';

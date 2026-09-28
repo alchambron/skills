@@ -89,8 +89,10 @@ test('dry run pins the fetched origin/work snapshot without dispatching a thread
   assert.match(result.prompt, /agent_run\.py doctor, then python3 \/Users\/alchambron\/\.codex\/skills\/joulemv-review-launcher\/scripts\/agent_run\.py start/);
   assert.match(result.prompt, /This worktree must start at origin\/work commit b{40}/);
   assert.match(result.prompt, /Merge the pinned PR head a{40}/);
-  assert.match(result.prompt, /If it conflicts, run git merge --abort, mark live scenarios Blocked/);
-  assert.match(result.prompt, /returned commit equals the verified integration commit/);
+  assert.match(result.prompt, /If the merge conflicts, run git merge --abort and keep this T3 worktree at the pinned origin\/work commit/);
+  assert.match(result.prompt, /Use git worktree add --detach at a unique path outside the T3 worktree for a{40}/);
+  assert.match(result.prompt, /live test from there as PR-head-only coverage/);
+  assert.match(result.prompt, /returned commit equals the verified integration commit or pinned PR head/);
   assert.match(result.prompt, /do not open the browser or capture a blank frame/);
   assert.match(result.prompt, /use preview_status first, then preview_open with the returned frontendUrl/);
   assert.match(result.prompt, /After any start attempt, including failure or early exit, run/);
