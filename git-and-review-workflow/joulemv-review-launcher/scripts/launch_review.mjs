@@ -432,6 +432,9 @@ function buildPrompt(selected, baseSha) {
     'inspect the saved image, and embed it in the final report. If the image is blank, blurred, or clips the observed result while page text exists, wait for rendering or resize the preview and retry twice. ' +
     'If T3 still cannot save a legible image, report the preview error and label visual evidence unavailable for that scenario; do not call it visually verified. ' +
     'For a blocked scenario without a visible browser state, explain why no picture exists; never embed an empty frame. ' +
+    'After any live test attempt, start the result with Pass, Fail, and Blocked counts, then a Markdown table with columns Scenario | Result | Expected | Actual | Evidence. ' +
+    'Give every manual-guide scenario one row. Use bold Pass, Fail, or Blocked in Result; put its saved screenshot link or the specific error or missing-prerequisite reason in Evidence. ' +
+    'If a defect stops the run early, mark remaining scenarios Blocked with that reason. Embed the inspected scenario pictures below the table. ' +
     'The CLI replays versioned tenant migrations in its database clone, but does not recreate root seed data; report missing root fixtures as a test gap. ' +
     'After any start attempt, including failure or early exit, run this from the test worktree: ' +
     'python3 /Users/alchambron/.codex/skills/joulemv-review-launcher/scripts/agent_run.py stop before your final reply. ' +

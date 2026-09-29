@@ -103,6 +103,8 @@ test('dry run pins the fetched origin/work snapshot without dispatching a thread
   assert.match(result.prompt, /blank, blurred, or clips the observed result/);
   assert.match(result.prompt, /retry twice/);
   assert.match(result.prompt, /label visual evidence unavailable/);
+  assert.match(result.prompt, /Markdown table with columns Scenario \| Result \| Expected \| Actual \| Evidence/);
+  assert.match(result.prompt, /Give every manual-guide scenario one row/);
   assert.match(result.prompt, /never embed an empty frame/);
   assert.match(result.prompt, /Never submit APPROVE or mark the PR approved/);
   assert.deepEqual(calls.posts, []);
