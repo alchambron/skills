@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from html.parser import HTMLParser
 import re
 import shutil
 import signal
@@ -20,7 +21,7 @@ import sys
 import time
 from uuid import uuid4
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 from urllib.request import urlopen
 
 
@@ -295,6 +296,84 @@ def http_ready(url):
         return False
 
 
+class ModuleScripts(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.sources = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "script":
+            attributes = dict(attrs)
+            if attributes.get("type") == "module" and attributes.get("src"):
+                self.sources.append(attributes["src"])
+
+
+MODULE_IMPORT = re.compile(
+    r"^[ \t]*(?:import|export)[ \t]+(?:[^\n]*?[ \t]+from[ \t]+)?[\"']([^\"']+)[\"']",
+    re.MULTILINE,
+)
+
+
+def frontend_ready(url):
+    """Fetch the module graph a browser needs, including optimized dependencies."""
+    try:
+        with urlopen(url, timeout=3) as response:
+            if response.status != 200:
+                return False
+            page = response.read().decode("utf-8")
+        parser = ModuleScripts()
+        parser.feed(page)
+        if not parser.sources:
+            return False
+        origin = urlparse(url).netloc
+        pending = [urljoin(url, source) for source in parser.sources]
+        seen = set()
+        while pending:
+            module_url = pending.pop()
+            if module_url in seen:
+                continue
+            if len(seen) >= 5000 or urlparse(module_url).netloc != origin:
+                return False
+            seen.add(module_url)
+            with urlopen(module_url, timeout=3) as response:
+                if response.status != 200 or "javascript" not in response.headers.get("Content-Type", ""):
+                    return False
+                source = response.read().decode("utf-8")
+            for match in MODULE_IMPORT.finditer(source):
+                specifier = match.group(1)
+                if specifier.startswith(("/", ".")):
+                    pending.append(urljoin(module_url, specifier))
+        return True
+    except (HTTPError, URLError, TimeoutError, OSError, UnicodeError):
+        return False
+
+
+def vite_paths(run_id):
+    if not re.fullmatch(r"[0-9a-f]{32}", run_id):
+        raise LaunchError("Invalid agent run ID")
+    frontend = ROOT / "frontend"
+    return (frontend / (".jmv-agent-vite-" + run_id + ".mjs"),
+            frontend / (".jmv-agent-vite-cache-" + run_id))
+
+
+def prepare_vite(run_id):
+    config, cache = vite_paths(run_id)
+    config.write_text(
+        "import baseConfig from './vite.config.ts';\n"
+        "import { mergeConfig } from 'vite';\n"
+        "export default mergeConfig(baseConfig, { cacheDir: " + json.dumps(str(cache)) + " });\n",
+        encoding="utf-8",
+    )
+    return config
+
+
+def cleanup_vite(run_id):
+    config, cache = vite_paths(run_id)
+    config.unlink(missing_ok=True)
+    if cache.exists():
+        shutil.rmtree(cache)
+
+
 def process_stamp(pid):
     result = subprocess.run(["ps", "-p", str(pid), "-o", "lstart="], capture_output=True, text=True)
     return result.stdout.strip() if result.returncode == 0 else ""
@@ -379,7 +458,7 @@ def start(timeout, max_runtime_minutes):
                 raise LaunchError("Worktree HEAD changed; stop this run before starting the new revision")
             if alive(existing.get("backendPid"), existing.get("backendStamp")) and \
                     alive(existing.get("frontendPid"), existing.get("frontendStamp")) and \
-                    http_ready(existing["backendUrl"] + "/login") and http_ready(existing["frontendUrl"]):
+                    http_ready(existing["backendUrl"] + "/login") and frontend_ready(existing["frontendUrl"]):
                 existing["expiresAt"] = time.time() + max_runtime_minutes * 60
                 write_state(existing)
                 output(ok=True, status="already_ready", expiresAt=existing["expiresAt"],
@@ -402,6 +481,7 @@ def start(timeout, max_runtime_minutes):
                  "runId": uuid4().hex}
         write_state(state)
         try:
+            vite_config = prepare_vite(state["runId"])
             tenant_count = create_agent_db(state, values, source, tools)
             app_env = {**java, **values,
                        "DB_URL": jdbc_url(source[0], source[1], state["dbName"]),
@@ -426,7 +506,8 @@ def start(timeout, max_runtime_minutes):
             write_state(state)
             with open(STATE_DIR / "frontend.log", "a", encoding="utf-8") as fe_log:
                 frontend = subprocess.Popen(["npm", "--prefix", "frontend", "run", "dev", "--",
-                                             "--host", "127.0.0.1", "--port", str(frontend_port), "--strictPort"],
+                                             "--config", str(vite_config), "--host", "127.0.0.1",
+                                             "--port", str(frontend_port), "--strictPort"],
                                             cwd=ROOT, env=frontend_env, stdout=fe_log,
                                             stderr=subprocess.STDOUT, start_new_session=True)
             state["frontendPid"] = frontend.pid
@@ -436,7 +517,7 @@ def start(timeout, max_runtime_minutes):
             while time.monotonic() < deadline:
                 if backend.poll() is not None or frontend.poll() is not None:
                     raise LaunchError("A server exited during startup; see backend.log and frontend.log")
-                if http_ready(backend_url + "/login") and http_ready(frontend_url):
+                if http_ready(backend_url + "/login") and frontend_ready(frontend_url):
                     state["phase"] = "ready"
                     state["expiresAt"] = time.time() + max_runtime_minutes * 60
                     write_state(state)
@@ -452,7 +533,7 @@ def start(timeout, max_runtime_minutes):
                            logs=str(STATE_DIR))
                     return
                 time.sleep(2)
-            raise LaunchError("Timed out waiting for backend /login and frontend /; see logs in %s" % STATE_DIR)
+            raise LaunchError("Timed out waiting for backend /login and frontend JavaScript modules; see logs in %s" % STATE_DIR)
         except Exception as startup_error:
             cleanup_errors = []
             for role in ("backend", "frontend"):
@@ -464,6 +545,10 @@ def start(timeout, max_runtime_minutes):
                 drop_agent_db(state, values, source, tools)
             except Exception as cleanup_error:
                 cleanup_errors.append("database: %s" % cleanup_error)
+            try:
+                cleanup_vite(state["runId"])
+            except OSError as cleanup_error:
+                cleanup_errors.append("Vite cache: %s" % cleanup_error)
             if cleanup_errors:
                 raise LaunchError("Startup failed: %s; cleanup failed: %s; state retained for retry" %
                                   (startup_error, "; ".join(cleanup_errors))) from startup_error
@@ -477,7 +562,7 @@ def status():
         output(ok=False, status="stopped", worktree=str(ROOT))
         return 1
     backend = alive(state.get("backendPid"), state.get("backendStamp")) and http_ready(state["backendUrl"] + "/login")
-    frontend = alive(state.get("frontendPid"), state.get("frontendStamp")) and http_ready(state["frontendUrl"])
+    frontend = alive(state.get("frontendPid"), state.get("frontendStamp")) and frontend_ready(state["frontendUrl"])
     ready = backend and frontend
     output(ok=ready, status="ready" if ready else "unhealthy",
            backendReady=backend, frontendReady=frontend,
@@ -500,6 +585,7 @@ def stop(expected_run_id=None):
         source = source_database(values)
         tools = pg_tools()
         drop_agent_db(state, values, source, tools)
+        cleanup_vite(state["runId"])
         STATE_FILE.unlink(missing_ok=True)
         output(ok=True, status="stopped", databaseDropped=True)
 
