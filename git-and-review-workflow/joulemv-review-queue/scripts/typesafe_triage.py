@@ -15,6 +15,33 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 ENDPOINT = "https://api.typesafe.ai/v1/systemone"
+MAX_ADAPTIVE_REQUESTS = 9
+
+
+class TypeSafeRequestError(ValueError):
+    """Retain safe failure metadata, never provider text or submitted evidence."""
+    def __init__(self, error_type, http_status=None, failures=None):
+        self.error_type = error_type
+        self.http_status = http_status
+        self.failures = failures or [(error_type, http_status)]
+        self.attempts = len(self.failures)
+        super().__init__(f"TypeSafe request failed: {error_type}" +
+                         (f" (HTTP {http_status})" if http_status is not None else ""))
+
+
+def http_error_type(error):
+    # Only this allowlisted code controls adaptive splitting. Response bodies can
+    # echo private evidence; never retain or log their messages or other fields.
+    if error.code == 400:
+        try:
+            body = json.loads(error.read(4096))
+            if body.get("detail", {}).get("error_type") == "max_tokens_exceeded":
+                return "max_tokens_exceeded"
+        except (ValueError, AttributeError, TypeError, OSError):
+            pass
+    return "http_error"
+
+
 PREDICATES = {
     "feedback": (
         "Does the focal human feedback still ask for a concrete fix, answer, or clarification?",
@@ -81,21 +108,32 @@ def build_payload(case, model):
 
 def request(payload, key):
     data = json.dumps(payload).encode()
+    failures = []
     for attempt in range(3):
         req = Request(ENDPOINT, data=data, headers={
             "Authorization": f"Bearer {key}", "Content-Type": "application/json",
         })
         try:
             with urlopen(req, timeout=45) as response:
-                return json.load(response)
+                result = json.load(response)
+                if not isinstance(result, dict):
+                    raise ValueError("Invalid response")
+                if failures:
+                    result = {**result, "_request_failures": failures}
+                return result
         except HTTPError as error:
-            # Response bodies may echo submitted private evidence; keep them out of logs.
+            error_type = http_error_type(error)
+            failures.append((error_type, error.code))
             if error.code in (429, 529) and attempt < 2:
                 time.sleep(2 ** attempt)
                 continue
-            raise ValueError(f"TypeSafe HTTP {error.code}") from None
+            raise TypeSafeRequestError(error_type, error.code, failures) from None
         except (URLError, TimeoutError):
-            raise ValueError("TypeSafe connection failed or timed out") from None
+            failures.append(("connection_error", None))
+            raise TypeSafeRequestError("connection_error", failures=failures) from None
+        except (ValueError, TypeError):
+            failures.append(("invalid_response", None))
+            raise TypeSafeRequestError("invalid_response", failures=failures) from None
 
 
 def interpret(payload, response):
@@ -160,7 +198,8 @@ def evaluate(payloads, key, workers=4, cache_dir=None):
     started = time.perf_counter()
     results, pending = {}, []
     metrics = {"cases": len(payloads), "cache_hits": 0, "requests": 0,
-               "input_tokens": 0, "output_tokens": 0}
+               "input_tokens": 0, "output_tokens": 0, "failed_requests": 0,
+               "retries": 0, "batch_splits": 0, "failure_counts": {}}
     # Alias targets can change without changing the input. Cache only exact versions.
     cache_enabled = cache_dir is not None and all(
         re.fullmatch(r"jev-\d+\.\d+\.\d+", p["model"]) for p in payloads)
@@ -189,42 +228,98 @@ def evaluate(payloads, key, workers=4, cache_dir=None):
         raise ValueError("Set TYPESAFE_API_KEY privately in the environment")
 
     def run(batch):
-        payload, members = batch
-        try:
-            response = request(payload, key)
-            if not isinstance(response, dict):
-                raise ValueError("Invalid response")
-            return members, response
-        except (ValueError, AttributeError, TypeError):
-            return members, {}
+        packets = []
+        counts = {"requests": 0, "failed_requests": 0, "retries": 0,
+                  "batch_splits": 0, "failure_counts": {}}
+        logical_requests = 0
+
+        def call(payload, members):
+            nonlocal logical_requests
+            if logical_requests >= MAX_ADAPTIVE_REQUESTS:
+                packets.append((members, {}, TypeSafeRequestError("overflow_retry_budget_exhausted")))
+                return
+            if logical_requests:
+                counts["retries"] += 1
+            logical_requests += 1
+            response, failure = {}, None
+            try:
+                response = request(payload, key)
+                if not isinstance(response, dict):
+                    raise ValueError("Invalid response")
+                failures = response.get("_request_failures", [])
+                counts["requests"] += len(failures) + 1
+            except TypeSafeRequestError as error:
+                failure = error
+                failures = error.failures
+                counts["requests"] += error.attempts
+            except (ValueError, AttributeError, TypeError):
+                failure = TypeSafeRequestError("invalid_response")
+                failures = failure.failures
+                counts["requests"] += 1
+            counts["retries"] += max(0, len(failures) - (1 if failure else 0))
+            counts["failed_requests"] += len(failures)
+            for error_type, _ in failures:
+                counts["failure_counts"][error_type] = counts["failure_counts"].get(error_type, 0) + 1
+            if failure and failure.error_type == "max_tokens_exceeded" and len(members) > 1:
+                counts["batch_splits"] += 1
+                middle = len(members) // 2
+                # Rebuild only the question map. Every child retains the entire
+                # conversation, including all later human replies and metadata.
+                for subset in (members[:middle], members[middle:]):
+                    child, _ = next(batches(subset))
+                    call(child, subset)
+            else:
+                packets.append((members, response, failure))
+
+        call(*batch)
+        return packets, counts
+
+    def record(members, response, failure):
+        usage = response.get("usage") or {}
+        if isinstance(usage, dict):
+            for field in ("input_tokens", "output_tokens"):
+                if type(usage.get(field)) is int and usage[field] >= 0:
+                    metrics[field] += usage[field]
+        answers = response.get("answers") or {}
+        for index, member in enumerate(members):
+            item = {"model": response.get("model"), "answers": {
+                "supported": answers.get(f"q{index}") if isinstance(answers, dict) else None,
+            }}
+            case_id = member["state"]["id"]
+            try:
+                if failure:
+                    raise failure
+                result = {**interpret(member, item), "cache_hit": False}
+            except (ValueError, AttributeError, TypeError):
+                results[case_id] = {"id": case_id, "suggestion": "unavailable",
+                                    "error_type": failure.error_type if failure else "invalid_answer",
+                                    "http_status": failure.http_status if failure else None,
+                                    "requires_agent_verification": True}
+                continue
+            results[case_id] = result
+            if cache_enabled and item["model"] == member["model"]:
+                single, _ = next(batches([member]))
+                target = cache_dir / (digest(single) + ".json")
+                with tempfile.NamedTemporaryFile(mode="w", dir=cache_dir, delete=False) as out:
+                    json.dump(item, out)
+                os.replace(out.name, target)
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        for members, response in pool.map(run, batches(pending)):
-            metrics["requests"] += 1
-            usage = response.get("usage") or {}
-            if isinstance(usage, dict):
-                for field in ("input_tokens", "output_tokens"):
-                    if type(usage.get(field)) is int and usage[field] >= 0:
-                        metrics[field] += usage[field]
-            answers = response.get("answers") or {}
-            for index, member in enumerate(members):
-                item = {"model": response.get("model"), "answers": {
-                    "supported": answers.get(f"q{index}") if isinstance(answers, dict) else None,
-                }}
-                case_id = member["state"]["id"]
-                try:
-                    result = {**interpret(member, item), "cache_hit": False}
-                except (ValueError, AttributeError, TypeError):
-                    results[case_id] = {"id": case_id, "suggestion": "unavailable",
-                                        "requires_agent_verification": True}
-                    continue
-                results[case_id] = result
-                if cache_enabled and item["model"] == member["model"]:
-                    single, _ = next(batches([member]))
-                    target = cache_dir / (digest(single) + ".json")
-                    with tempfile.NamedTemporaryFile(mode="w", dir=cache_dir, delete=False) as out:
-                        json.dump(item, out)
-                    os.replace(out.name, target)
+        for packets, counts in pool.map(run, batches(pending)):
+            for field in ("requests", "failed_requests", "retries", "batch_splits"):
+                metrics[field] += counts[field]
+            for error_type, count in counts["failure_counts"].items():
+                metrics["failure_counts"][error_type] = metrics["failure_counts"].get(error_type, 0) + count
+            for members, response, failure in packets:
+                record(members, response, failure)
+
+    metrics["unavailable_cases"] = sum(r["suggestion"] == "unavailable" for r in results.values())
+    metrics["uncertain_cases"] = sum(r["suggestion"] == "uncertain" for r in results.values())
+    metrics["unavailable_error_counts"] = {}
+    for result in results.values():
+        if result["suggestion"] == "unavailable":
+            error_type = result["error_type"]
+            metrics["unavailable_error_counts"][error_type] = metrics["unavailable_error_counts"].get(error_type, 0) + 1
     metrics["elapsed_seconds"] = round(time.perf_counter() - started, 3)
     metrics["cache_enabled"] = cache_enabled
     return {"results": [results[p["state"]["id"]] for p in payloads], "metrics": metrics}

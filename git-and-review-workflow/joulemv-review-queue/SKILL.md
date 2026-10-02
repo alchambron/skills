@@ -14,24 +14,24 @@ Use [scripts/review_queue.py](scripts/review_queue.py) as the default execution 
 Resolve SCRIPT to `scripts/review_queue.py` beside this skill and OUTPUT to a local working directory:
 
 ```sh
-python3 SCRIPT --output OUTPUT --cache-dir ~/.cache/joulemv-review-queue/jev
+python3 SCRIPT --output OUTPUT --cache-dir ~/.cache/joulemv-review-queue/jev --format checkbox
 ```
 
-Read `metrics.json` and `report.txt` from OUTPUT. Return the report in the user's language. Routine invocations do not require loading source code, replaying cases, or independently rereading every PR. The pipeline is read-only on GitHub and never sends the report.
+Read `metrics.json` and `report.txt` from OUTPUT. Check GitHub collection coverage and `jev.unavailable_cases` separately: a successful command can still have incomplete interpretation. Return the checkbox report in the user's language, preserving its bold headings, spacing, task checkboxes, and PR links. `--format checkbox` is also the script default; `--format detailed` retains the discussion-link report for diagnosis. Routine invocations do not require loading source code or independently rereading every PR. The pipeline is read-only on GitHub and never sends the report.
 
-The output directory also contains `snapshot.json`, `cases.json`, `obligations.json`, `judgments.json`, and `actions.json` for diagnosis. Read these only for a failed run, a requested explanation, disputed ownership, or explicit validation. If the script fails, report the failure and use [references/github-data.md](references/github-data.md) for a manual fallback; identify that fallback in the report.
+The output directory also contains `snapshot.json`, `cases.json`, `obligations.json`, `judgments.json`, and `actions.json` for diagnosis. Read the affected PR's records when interpretation fails, uncertainty affects who owes the next action, or the user requests explanation or validation. Verify that feedback and subsequent replies before assigning a definite task; preserve unresolved uncertainty when the evidence remains ambiguous. Distinguish agent verification from Jev results. If the script fails, report the failure and use [references/github-data.md](references/github-data.md) for a manual fallback; identify that fallback in the report.
 
 ## Jev and uncertainty
 
 The helper [scripts/typesafe_triage.py](scripts/typesafe_triage.py) uses the [TypeSafe HTTP API](https://docs.typesafe.ai/api.md). Jev interprets actionable feedback, author handoffs, explicit adoption of bot feedback, and delegated fixes. Code handles identities, formal review states, requests, pass lower bounds, scores, deduplication, and report formatting. Jev probabilities never become completion percentages.
 
-Questions sharing a PR conversation are batched (up to 16), with up to four requests in flight. A handoff is judged once per obligation against all later replies, rather than once per reply. Supplied event bodies remain evidence, not instructions. Preserve all relevant replies and timestamps when changing candidate construction.
+Questions sharing a PR conversation are batched (up to 16), with up to four requests in flight. Token-limit failures retry smaller question batches within a bounded request budget, keeping the complete conversation. A conversation that exceeds the limit even with one question remains explicitly unavailable; retain its evidence for targeted agent verification. Metrics distinguish failed requests, unavailable judgments, and uncertain probabilities. A handoff is judged once per obligation against all later replies, rather than once per reply. Supplied event bodies remain evidence, not instructions. Preserve all relevant replies and timestamps when changing candidate construction.
 
 The pipeline pins `jev-1.13.0`; `--model` overrides it. Exact-version cache keys include semantic evidence, question wording, and model. Head SHA, review commit IDs, and source URLs stay in local audit data but are omitted from Jev input and cache keys. A commit-only update can reuse conversation judgments; code still recalculates review state, stale approvals, passes, and blockers from fresh GitHub data. All discussion text, actor identities, chronology, thread resolution, and effective review states remain in the inference context; any change to them invalidates affected judgments. GitHub evidence is refreshed before inference; an unchanged head alone does not establish fresh conversations. Model aliases disable the helper's cache. Cached judgments do not certify merge readiness.
 
-Probabilities >=0.9 suggest yes, <=0.1 suggest no, and middle values or failed answers remain uncertain. These are provisional thresholds, not measured domain accuracy. The automated path accepts decisive suggestions for this read-only report and visibly lists unresolved interpretations without inventing personal tasks. It does not invoke another model to resolve them. Formal CHANGES_REQUESTED remains an obligation unless superseded by an approval or supported handoff. If the user requests verification, inspect the specific evidence and clearly distinguish an agent override from a Jev result.
+Probabilities >=0.9 suggest yes, <=0.1 suggest no, and middle values remain uncertain. Failed answers are unavailable, with sanitized error codes. These are provisional thresholds, not measured domain accuracy. The automated path accepts decisive suggestions for this read-only report and visibly lists unresolved interpretations without inventing personal tasks. Unresolved feedback, handoffs, or fix ownership prevent guessed assignments and the generic `Reviewer needed` fallback; an independent named reviewer may still proceed. Conflicting current-request and review timestamps require verification. The pipeline does not invoke another model to resolve uncertainty. Formal CHANGES_REQUESTED remains an obligation unless superseded by an approval or supported handoff; uncertainty about a designated fix owner is recorded separately.
 
-The helper's `requires_agent_verification` flag is retained for its standalone diagnostic mode. The automated queue deliberately surfaces uncertainty rather than requiring that verification loop; it is not an assertion that all classifications are verified.
+The helper's `requires_agent_verification` flag is retained for diagnosis. The automated queue's decisive suggestions are not independently verified facts; use the targeted verification above when uncertainty or failure affects the next action.
 
 ## Coverage and measurement
 
@@ -55,7 +55,7 @@ Assign actions as follows:
 
 - **Respond to human review:** default to the PR author, or an explicitly designated fix owner supported by assignment/comment evidence. Include active human CHANGES_REQUESTED reviews and unresolved actionable human feedback, including clear requests in COMMENTED reviews or issue comments. The response may be a code fix, an answer to a question, or a clarification. Exclude thanks, approvals, resolved discussion, and feedback already handed back for re-review. Link the feedback and name its human source. Assignees alone do not prove who should review or that every assignee must fix the PR.
 - **Review:** assign each explicitly requested human reviewer. Team requests belong in a separate `Team review requested` group, without assigning every team member personally. Include only reviews currently owed. If an author fix blocks re-review, list the author's response action and omit the waiting reviewer until a handoff makes their review actionable. Keep independent review requests that can proceed.
-- **Re-review:** use an explicit renewed request or a clear author handoff after fixes. If the author says the feedback is addressed and asks for re-review, give the previous human reviewer the next action even if GitHub still shows CHANGES_REQUESTED. Mark this as inferred when it is not a formal request. New commits alone only suggest possible readiness; keep the fix obligation marked `confirm fixes / request re-review` until the handoff is supported. Do not infer that every previous reviewer owes another review.
+- **Re-review:** use an active renewed request or a clear author handoff after fixes that the reviewer has not subsequently answered. A historical request consumed by a later submitted review or removed from current requests is not a current handoff. If the author says the feedback is addressed and asks for re-review, give the previous human reviewer the next action even if GitHub still shows CHANGES_REQUESTED. Mark this as inferred when it is not a formal request. New commits alone only suggest possible readiness; keep the fix obligation marked `confirm fixes / request re-review` until the handoff is supported. Do not infer that every previous reviewer owes another review.
 - **Reviewer unassigned:** include a compact `Reviewer needed` group only when a human review is actually required now and no reviewer is named. Do not invent a personal assignment from authorship, collaborator membership, or CODEOWNERS alone. Requesting a reviewer is not a separate personal task in this report.
 - Conflicts, failed checks, and other merge blockers are context for an already eligible human action. They never create a standalone action entry.
 
@@ -92,19 +92,23 @@ Apply these overrides after choosing the stage. Qualifying drafts always remain 
 
 ## Teams-ready report
 
-Return the message itself, ready to copy into Microsoft Teams. Use short person labels, simple bullets, blank lines, and full PR URLs on their own lines. Avoid Markdown tables, code fences, nested lists, HTML, and introductory commentary outside the message. Write in the user's language. A plain name or GitHub login is a label, not a working Teams mention.
+Return the message itself, ready to copy into Microsoft Teams. Use bold report and owner headings, `- [ ]` checkboxes with bold action and PR number, a separate progress/detail line, blank lines between actions, and one full PR URL per action on its own line. The checkbox report omits discussion links and routine unknown-check text. Avoid Markdown tables, code fences, nested lists, HTML, and introductory commentary outside the message. Write in the user's language. A plain name or GitHub login is a label, not a working Teams mention.
 
 Start with `JouleMV review actions` and collection date/time/timezone, then a short count of unique PRs and people with pending actions. Show average estimated progress for unique included non-draft PRs only, with its denominator. This is progress of the action queue, not the whole repository. Never double-count a PR listed under multiple people. Use `N/A` when the denominator is zero; label partial data and its coverage explicitly.
 
 Group only people who currently owe an action. Sort responses to human feedback first, then reviews, oldest waiting first within each action. Deduplicate person/PR/action entries. Use this shape, replacing placeholders with live evidence:
 
-Person name / GitHub login
-• Respond to human review: #NUMBER, PR title. Pass 1, 30%. Address REVIEWER's feedback about TOPIC.
-FULL_PR_URL
-• Review: #NUMBER, PR title. Pass 2, 50%. Re-review the author's fixes.
-FULL_PR_URL
+**Person name / GitHub login**
 
-Include short team-request or `Reviewer needed` groups only when a review is currently actionable and a person cannot be named. Every PR entry gets an action, title, link, pass, and estimated percentage. Add a feedback link or brief blocker only when needed to explain the next action. Mark uncertain ownership or pass counts clearly.
+- [ ] **Respond to human review · #NUMBER** — PR title  
+  **30%** · Pass 1. Address REVIEWER's feedback about TOPIC.  
+  FULL_PR_URL
+
+- [ ] **Review · #NUMBER** — PR title  
+  **50%** · Pass 2. Re-review the author's fixes.  
+  FULL_PR_URL
+
+Include short team-request or `Reviewer needed` groups only when a review is currently actionable and a person cannot be named. In `Reviewer needed`, name the PR author in each checkbox without assigning the review to that author. Every PR entry gets an action, title, PR link, pass, and estimated percentage. Show brief material blockers when they affect the next action. Mark uncertain ownership or pass counts clearly.
 
 Omit people with no pending actions, completed reviews, assignment inventories, bot-only work, standalone CI/conflict fixes, and ready-to-merge lists. With no qualifying actions, say `No pending human review actions found.` Mention missing access if that conclusion is incomplete.
 

@@ -228,10 +228,46 @@ def effective_reviews(pr):
     return latest
 
 
+def latest_request_at(pr, reviewer):
+    return max((e.get('createdAt', '') for e in pr['timelineItems']
+                if (e.get('requestedReviewer') or {}).get('login') == reviewer), default='')
+
+
+def latest_review_at(pr, reviewer):
+    return max((r.get('submittedAt') or '' for r in pr['reviews']
+                if human(r.get('author')) and r['author']['login'] == reviewer
+                and r['state'] != 'PENDING'), default='')
+
+
+def current_request_at(pr, reviewer):
+    """An active request must also be later than the review that consumed it."""
+    if not any((r.get('requestedReviewer') or {}).get('login') == reviewer
+               for r in pr['reviewRequests']):
+        return None
+    requested, reviewed = latest_request_at(pr, reviewer), latest_review_at(pr, reviewer)
+    return requested if requested and requested > reviewed else None
+
+
+def author_handoff_pending(pr, reviewer, feedback_at):
+    author = (pr.get('author') or {}).get('login')
+    replies = [r for r in body_records(pr) if (r.get('author') or {}).get('login') == author
+               and (r.get('submittedAt') or r.get('createdAt') or '') > feedback_at
+               and (r.get('body') or '').strip()]
+    replied = max((r.get('submittedAt') or r.get('createdAt') or '' for r in replies), default='')
+    reviewed = latest_review_at(pr, reviewer)
+    return bool(replied and replied > reviewed)
+
+
+def mentioned_people(body):
+    prose = re.sub(r'```[^\n]*\n[\s\S]*?```|`[^`]*`', '', body)
+    return set(re.findall(r'(?<![A-Za-z0-9_./])@([A-Za-z0-9-]+)(?![A-Za-z0-9-]|\s*\()', prose))
+
+
 def prepare(snapshot):
     cases, obligations = [], []
     for pr in snapshot['prs']:
         author = (pr.get('author') or {}).get('login', 'unknown')
+        actors = {(r.get('author') or {}).get('login'): r.get('author') for r in body_records(pr)}
         effective = effective_reviews(pr)
         events, candidates = {}, []
         # Keep the complete human discussion, plus bot roots only for human replies.
@@ -290,8 +326,8 @@ def prepare(snapshot):
                 cases.append(dict(context, id=hid, kind='handoff', focal_id=raw['id'], subject=f'Considering all later author replies, is there a CURRENT author handoff to {who} for feedback {raw["id"]}? This focal event is the original feedback. A later request to fix more supersedes an earlier handoff.'))
                 obligation['handoffs'].append(hid)
             for reply in replies:
-                for person in sorted(set(re.findall(r'@([A-Za-z0-9-]+)', reply['body']))):
-                    if person in (author, who):
+                for person in sorted(mentioned_people(reply['body'])):
+                    if person in (author, who) or not human(actors.get(person) or {'login': person}):
                         continue
                     did = oid + ':delegation:' + reply['id'] + ':' + person
                     cases.append(dict(context, id=did, kind='delegation', focal_id=reply['id'], subject=f'{person} designated to address feedback {raw["id"]} from {who}.'))
@@ -360,45 +396,77 @@ def compose(snapshot, obligations, judgments):
     prs = {p['number']: p for p in snapshot['prs']}
     def status(cid):
         return by_id.get(cid, {}).get('suggestion', 'unavailable')
+    def unresolved(ob, ids, reason):
+        failed = [by_id.get(cid, {}) for cid in ids if status(cid) == 'unavailable']
+        if failed:
+            errors = sorted({j.get('error_type', 'answer_unavailable') for j in failed})
+            reason = 'Interpretation unavailable (' + ', '.join(errors) + '); verify the feedback and next owner.'
+        uncertainties.append({'pr': ob['pr'], 'reviewer': ob['reviewer'],
+                              'evidence': ob['url'], 'reason': reason})
     for ob in obligations:
         pr = prs[ob['pr']]
         author = (pr.get('author') or {}).get('login', 'unknown')
         answer = 'yes' if ob['formal'] else status(ob['classification'])
-        handoff = any(status(cid) == 'yes' for cid in ob['handoffs'])
-        formal_handoff = any(e.get('createdAt', '') > ob['at'] and (e.get('requestedReviewer') or {}).get('login') == ob['reviewer'] for e in pr['timelineItems'])
+        handoff_pending = author_handoff_pending(pr, ob['reviewer'], ob['at'])
+        handoff = handoff_pending and any(status(cid) == 'yes' for cid in ob['handoffs'])
+        request_at = current_request_at(pr, ob['reviewer'])
+        formal_handoff = bool(request_at and request_at > ob['at'])
         if handoff or formal_handoff:
-            actions.append({'pr': ob['pr'], 'owner': ob['reviewer'], 'action': 'Review', 'at': ob['at'], 'detail': 'Re-review fixes' + (' (inferred handoff).' if handoff and not formal_handoff else '.'), 'evidence': ob['url'], 'rereview': True})
+            actions.append({'pr': ob['pr'], 'owner': ob['reviewer'], 'action': 'Review', 'at': request_at or ob['at'], 'detail': 'Re-review fixes' + (' (inferred handoff).' if handoff and not formal_handoff else '.'), 'evidence': ob['url'], 'rereview': True})
             continue
+        if handoff_pending and any(status(cid) in ('uncertain', 'unavailable') for cid in ob['handoffs']):
+            unresolved(ob, ob['handoffs'], 'Whether the reviewer has been asked back is uncertain.')
+            if not ob['formal']:
+                continue
         if answer == 'no':
             continue
         if answer != 'yes':
-            uncertainties.append({'pr': ob['pr'], 'evidence': ob['url'], 'reason': 'Whether this feedback still needs a response is uncertain.'})
+            unresolved(ob, [ob['classification']], 'Whether this feedback still needs a response is uncertain.')
             continue
-        owners = {person for cid, person in ob['delegations'] if status(cid) == 'yes'}
+        actors = {(r.get('author') or {}).get('login'): r.get('author') for r in body_records(pr)}
+        delegations = [(cid, person) for cid, person in ob['delegations']
+                       if human(actors.get(person) or {'login': person})]
+        owners = {person for cid, person in delegations if status(cid) == 'yes'}
+        if any(status(cid) in ('uncertain', 'unavailable') for cid, _ in delegations) or len(owners) > 1:
+            unresolved(ob, [cid for cid, _ in delegations], 'Who owes the response to this feedback is uncertain.')
+            continue
         owner = next(iter(owners)) if len(owners) == 1 else author
         detail = f'Address {ob["reviewer"]}\'s feedback.'
-        if len(owners) > 1:
-            detail += ' Fix ownership uncertain.'
+        if ob['formal'] and any(c['commit'].get('committedDate', '') > ob['at'] for c in pr['commits']):
+            detail = f'Address {ob["reviewer"]}\'s feedback, or confirm fixes and request re-review.'
         actions.append({'pr': ob['pr'], 'owner': owner, 'action': 'Respond to human review', 'at': ob['at'], 'detail': detail, 'evidence': ob['url'], 'reviewer': ob['reviewer']})
     for pr in snapshot['prs']:
         present = [a for a in actions if a['pr'] == pr['number']]
-        effective = effective_reviews(pr)
+        uncertain_reviewers = {u.get('reviewer') for u in uncertainties if u['pr'] == pr['number']}
+        eligible_requests = []
         for request in pr['reviewRequests']:
             actor = request.get('requestedReviewer') or {}
             if actor.get('__typename') == 'Team':
                 owner = 'Team review requested: ' + actor['slug']
             elif human(actor):
                 owner = actor['login']
+                eligible_requests.append(owner)
+                requested = latest_request_at(pr, owner)
+                if requested and requested <= latest_review_at(pr, owner):
+                    uncertainties.append({'pr': pr['number'], 'reviewer': owner, 'evidence': pr['url'],
+                                          'reason': 'Review request state and chronology disagree; verify whether re-review is still owed.'})
+                    continue
+                if owner in uncertain_reviewers:
+                    continue
                 if any(a['action'] == 'Respond to human review' and a.get('reviewer') == owner for a in present):
                     continue
             else:
                 continue
-            actions.append({'pr': pr['number'], 'owner': owner, 'action': 'Review', 'at': pr['updatedAt'], 'detail': 'Review requested.'})
+            if actor.get('__typename') == 'Team':
+                eligible_requests.append(owner)
+            actions.append({'pr': pr['number'], 'owner': owner, 'action': 'Review',
+                            'at': current_request_at(pr, owner) or pr['updatedAt'], 'detail': 'Review requested.'})
         count, known = required_count(snapshot, pr)
         approvals = approval_count(snapshot, pr)
-        if not pr['isDraft'] and not pr['reviewRequests'] and count > approvals and not present:
+        if (not pr['isDraft'] and not eligible_requests and count > approvals and not present
+                and not any(u['pr'] == pr['number'] for u in uncertainties)):
             actions.append({'pr': pr['number'], 'owner': 'Reviewer needed', 'action': 'Review', 'at': pr['updatedAt'], 'detail': 'Required human review has no named reviewer.'})
-        if not known and not count and not present and not pr['reviewRequests']:
+        if not known and not count and not present and not eligible_requests:
             uncertainties.append({'pr': pr['number'], 'evidence': pr['url'], 'reason': 'Cannot verify all required-review rules.'})
     dedup = {}
     for a in actions:
@@ -409,6 +477,7 @@ def compose(snapshot, obligations, judgments):
             dedup[key]['rereview'] = True
     actions = list(dedup.values())
     blocked = {(a['pr'], a.get('reviewer')) for a in actions if a['action'] == 'Respond to human review'}
+    blocked.update((u['pr'], u.get('reviewer')) for u in uncertainties if u.get('reviewer'))
     actions = [a for a in actions if a['action'] != 'Review' or (a['pr'], a['owner']) not in blocked]
     for pr in snapshot['prs']:
         items = [a for a in actions if a['pr'] == pr['number']]
@@ -434,39 +503,82 @@ def compose(snapshot, obligations, judgments):
     return actions, uncertainties
 
 
-def render(snapshot, actions, uncertainties):
+def render(snapshot, actions, uncertainties, format_style='checkbox'):
     prs = {p['number']: p for p in snapshot['prs']}
     scores = {a['pr']: a['score'] for a in actions if not a['draft']}
     people = {a['owner'] for a in actions if a['owner'] != 'Reviewer needed' and not a['owner'].startswith('Team review requested:')}
     average = f'{sum(scores.values())/len(scores):.0f}% ({len(scores)} non-draft PRs)' if scores else 'N/A (0 non-draft PRs)'
-    lines = ['JouleMV review actions', snapshot['collected_at'] + ' — America/Toronto',
-             f'{len({a["pr"] for a in actions})} PRs; {len(people)} people. Average estimated progress: {average}.']
+    pr_count = len({a['pr'] for a in actions})
+    if format_style == 'checkbox':
+        collected = datetime.fromisoformat(snapshot['collected_at']).strftime('%B %d, %Y · %I:%M %p')
+        lines = ['**JouleMV review actions**', '', f'{collected} · America/Toronto', '',
+                 f'**{pr_count} PRs · {len(people)} people · Average progress: {average}**']
+    else:
+        lines = ['JouleMV review actions', snapshot['collected_at'] + ' — America/Toronto',
+                 f'{pr_count} PRs; {len(people)} people. Average estimated progress: {average}.']
     if snapshot['errors']:
-        lines.append(f'Partial collection: {len(snapshot["prs"])}/{snapshot["open_count"]} open PRs; ' + '; '.join(snapshot['errors']))
+        label = '**Partial collection:**' if format_style == 'checkbox' else 'Partial collection:'
+        lines.append(f'{label} {len(snapshot["prs"])}/{snapshot["open_count"]} open PRs; ' + '; '.join(snapshot['errors']))
+    interpretation = snapshot.get('interpretation_metrics') or {}
+    if interpretation.get('unavailable_cases'):
+        label = '**Partial interpretation:**' if format_style == 'checkbox' else 'Partial interpretation:'
+        lines.append(f'{label} {interpretation["unavailable_cases"]}/{interpretation["cases"]} judgments unavailable; '
+                     'affected feedback and next actions require verification.')
     if not actions:
-        lines.append('No confirmed pending human review actions found.' if uncertainties else 'No pending human review actions found.')
+        lines.append('No confirmed pending human review actions found.' if uncertainties or interpretation.get('unavailable_cases') else 'No pending human review actions found.')
     for owner in sorted({a['owner'] for a in actions}, key=str.lower):
-        lines.extend(['', owner])
+        if format_style == 'checkbox':
+            if lines[-1]:
+                lines.append('')
+            lines.extend([f'**{owner}**', ''])
+        else:
+            lines.extend(['', owner])
         for a in sorted((a for a in actions if a['owner'] == owner), key=lambda a: (a['action'] != 'Respond to human review', a['at'], a['pr'])):
             pr = prs[a['pr']]
             blocker = ' Merge conflict.' if pr.get('mergeable') == 'CONFLICTING' else ''
             checks = pr.get('required_checks')
-            if checks is None:
+            if checks is None and format_style == 'detailed':
                 blocker += ' Required checks unknown.'
-            elif any(c.get('bucket') in ('fail', 'cancel') for c in checks):
+            elif any(c.get('bucket') in ('fail', 'cancel') for c in checks or []):
                 blocker += ' Required checks failed.'
-            elif any(c.get('bucket') == 'pending' for c in checks):
+            elif format_style == 'detailed' and any(c.get('bucket') == 'pending' for c in checks or []):
                 blocker += ' Required checks pending.'
             if a.get('stage_score', a['score']) != a['score']:
                 blocker += f' Review stage {a["stage_score"]}% before blocker cap.'
-            lines.extend([f'• {a["action"]}: #{a["pr"]}, {pr["title"]}. {a["pass_label"]}, {a["score"]}%.' + (' Draft.' if a['draft'] else '') + ' ' + a['detail'] + blocker, pr['url']])
-            if a.get('evidence') and a['evidence'] != pr['url']:
+            detail = a['detail']
+            if owner == 'Reviewer needed' and format_style == 'checkbox':
+                detail = f"Created by {(pr.get('author') or {}).get('login') or 'unknown'}."
+            if format_style == 'checkbox':
+                pass_label = a['pass_label'].replace('; conservative', ' (conservative)').capitalize()
+                if blocker:
+                    blocker = blocker.replace(' Merge conflict.', ' **Blocker:** merge conflict.').replace(' Required checks failed.', ' **Blocker:** required checks failed.')
+                title = f'- [ ] **{a["action"]} · #{a["pr"]}** — {pr["title"]}  '
+                status = f'  **{a["score"]}%** · {pass_label}.' + (' Draft.' if a['draft'] else '') + ' ' + detail + blocker + '  '
+                lines.extend([title, status, f'  {pr["url"]}', ''])
+            else:
+                entry = f'• {a["action"]}: #{a["pr"]}, {pr["title"]}. {a["pass_label"]}, {a["score"]}%.' + (' Draft.' if a['draft'] else '') + ' ' + detail + blocker
+                lines.extend([entry, pr['url']])
+            if format_style == 'detailed' and a.get('evidence') and a['evidence'] != pr['url']:
                 lines.append(a['evidence'])
     if uncertainties:
-        lines.extend(['', f'Uncertain evidence: {len(uncertainties)} items across {len({u["pr"] for u in uncertainties})} PRs; these are not confirmed personal tasks.'])
+        label = '**Uncertain evidence**' if format_style == 'checkbox' else 'Uncertain evidence:'
+        separator = ' · ' if format_style == 'checkbox' else ' '
+        if lines[-1]:
+            lines.append('')
+        lines.append(f'{label}{separator}{len(uncertainties)} items across {len({u["pr"] for u in uncertainties})} PRs; these are not confirmed personal tasks.')
+        if format_style == 'checkbox':
+            lines.append('')
         for number in sorted({u['pr'] for u in uncertainties}):
-            lines.extend([f'• #{number}: ' + ' '.join(sorted({u['reason'] for u in uncertainties if u['pr'] == number})), prs[number]['url']])
-    lines.extend(['', 'Percentages estimate workflow progress conservatively; later confirmed human passes advance the score, subject to merge blockers. Detailed merge gates are not certified.'])
+            number_label = f'**#{number}**' if format_style == 'checkbox' else f'#{number}'
+            lines.append(f'• {number_label}: ' + ' '.join(sorted({u['reason'] for u in uncertainties if u['pr'] == number})))
+            if format_style == 'detailed':
+                lines.append(prs[number]['url'])
+            else:
+                lines.append('')
+    footer = 'Percentages estimate workflow progress conservatively; later confirmed human passes advance the score, subject to merge blockers. Detailed merge gates are not certified.'
+    if lines[-1]:
+        lines.append('')
+    lines.append(f'*{footer}*' if format_style == 'checkbox' else footer)
     return '\n'.join(lines) + '\n'
 
 
@@ -477,6 +589,8 @@ def main():
     parser.add_argument('--collect-only', action='store_true')
     parser.add_argument('--workers', type=int, choices=range(1, 9), default=8)
     parser.add_argument('--model', default='jev-1.13.0')
+    parser.add_argument('--format', dest='format_style', choices=('checkbox', 'detailed'), default='checkbox',
+                        help='Report layout; checkbox is the default Teams format')
     parser.add_argument('--cache-dir', type=Path)
     parser.add_argument('--full-collection', action='store_true', help='Fetch all discussion bodies, bypassing incremental text reuse')
     args = parser.parse_args()
@@ -494,13 +608,16 @@ def main():
         return
     payloads = [jev.build_payload(c, args.model) for c in cases]
     output = jev.evaluate(payloads, os.environ.get('TYPESAFE_API_KEY'), min(args.workers, 4), args.cache_dir)
+    snapshot['interpretation_metrics'] = output['metrics']
     actions, uncertainties = compose(snapshot, obligations, output['results'])
     checks_metrics = None
     if not args.snapshot:
         checks_metrics = collect_checks(snapshot, actions, args.workers)
         write_json(args.output / 'snapshot.json', snapshot)
         actions, uncertainties = compose(snapshot, obligations, output['results'])
-    report = render(snapshot, actions, uncertainties)
+    else:
+        write_json(args.output / 'snapshot.json', snapshot)
+    report = render(snapshot, actions, uncertainties, args.format_style)
     write_json(args.output / 'judgments.json', output)
     write_json(args.output / 'actions.json', {'actions':actions, 'uncertainties':uncertainties})
     (args.output / 'report.txt').write_text(report)
