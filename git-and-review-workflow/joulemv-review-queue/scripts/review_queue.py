@@ -581,7 +581,8 @@ def priority_section(snapshot, actions, merge, format_style):
         if found:
             state += (' **Blocker:** ' if checkbox else ' Blocker: ') + ', '.join(found) + '.'
         if checkbox:
-            lines.extend([f'- **{entry["priority"]["level"]} · #{number}** — {pr["title"]}  ',
+            level = entry['priority']['level']
+            lines.extend([f'- {signals.icons(entry)} **{level} · #{number}** — {pr["title"]}  ',
                           f'  {signals.summary(entry, level=False)}  ', f'  {state}  ', f'  {pr["url"]}', ''])
         else:
             lines.extend([f'• {entry["priority"]["level"]}: #{number}, {pr["title"]}. {signals.summary(entry, markdown=False, level=False)} {state}', pr['url']])
@@ -590,7 +591,8 @@ def priority_section(snapshot, actions, merge, format_style):
         lines.extend(['Security effect unclear, verify: ' + ', '.join(f'#{n}' for n in verify) + '.', ''])
     counts = {level: sum(not prs[n]['isDraft'] and m['priority']['level'] == level for n, m in merge.items())
               for level in signals.PRIORITY}
-    lines.append(' · '.join(f'{level} {counts[level]}' for level in reversed(signals.PRIORITY)) + ' (non-draft PRs)')
+    lines.append(' · '.join((f'{signals.PRIORITY_DOT[level]} ' if checkbox else '') + f'{level} {counts[level]}'
+                            for level in reversed(signals.PRIORITY)) + ' (non-draft PRs)')
     return lines
 
 
@@ -658,7 +660,8 @@ def render(snapshot, actions, uncertainties, format_style='checkbox', merge=None
                 pass_label = a['pass_label'].replace('; conservative', ' (conservative)').capitalize()
                 if blocker:
                     blocker = blocker.replace(' Merge conflict.', ' **Blocker:** merge conflict.').replace(' Required checks failed.', ' **Blocker:** required checks failed.')
-                title = f'- [ ] **{a["action"]} · #{a["pr"]}** — {pr["title"]}  '
+                dot = f'{signals.icons(merge[a["pr"]])} ' if a['pr'] in merge else ''
+                title = f'- [ ] {dot}**{a["action"]} · #{a["pr"]}** — {pr["title"]}  '
                 status = f'  **{a["score"]}%** · {pass_label}.' + (' Draft.' if a['draft'] else '') + ' ' + detail + blocker + '  '
                 signal = [f'  {signals.summary(merge[a["pr"]])}  '] if a['pr'] in merge else []
                 lines.extend([title, status, *signal, f'  {pr["url"]}', ''])
@@ -686,8 +689,10 @@ def render(snapshot, actions, uncertainties, format_style='checkbox', merge=None
                 lines.append('')
     footer = 'Percentages estimate workflow progress conservatively; later confirmed human passes advance the score, subject to merge blockers. Detailed merge gates are not certified.'
     if merge:
-        footer += (' Priority ranks merge urgency, security first (Urgent, High, Medium, Low);'
-                   ' Attention ranks review care from changed files (Critical, Careful, Standard, Light).')
+        def scale(levels, icon):
+            return ', '.join((f'{icon[level]} ' if format_style == 'checkbox' else '') + level for level in reversed(levels))
+        footer += (f' Priority ranks merge urgency, security first ({scale(signals.PRIORITY, signals.PRIORITY_DOT)});'
+                   f' Attention ranks review care from changed files ({scale(signals.ATTENTION, signals.ATTENTION_ICON)}).')
     if lines[-1]:
         lines.append('')
     lines.append(f'*{footer}*' if format_style == 'checkbox' else footer)

@@ -126,10 +126,10 @@ class Report(unittest.TestCase):
         merge = signals.assess(snap, [{'id': k, **v} for k, v in {**judged(7, 'yes', 'yes'), **judged(8), **judged(9)}.items()])
         report = q.render(snap, [], [], 'checkbox', merge)
         self.assertIn('**Merge priority · security first**', report)
-        self.assertIn('- **Urgent · #7**', report)
+        self.assertIn('- 🔴🔍 **Urgent · #7**', report)
         self.assertIn('No pending human review action; 0/1 required approvals.', report)
         self.assertNotIn('#9', report)
-        self.assertIn('Urgent 1 · High 0 · Medium 0 · Low 1 (non-draft PRs)', report)
+        self.assertIn('🔴 Urgent 1 · 🟠 High 0 · 🟡 Medium 0 · ⚪ Low 1 (non-draft PRs)', report)
         self.assertIn('  Security fix, weakness live now · Attention **Careful** (backend code).', report)
 
     def test_unclear_security_is_listed_for_verification(self):
@@ -165,6 +165,9 @@ class Report(unittest.TestCase):
                   'score': 10, 'stage_score': 10, 'pass_label': 'pass 1', 'draft': False}
         report = q.render(snap, [action], [], 'checkbox', merge)
         self.assertIn('Priority **Medium** (bug fix) · Attention **Critical** (SQL migration).', report)
+        self.assertIn('- [ ] 🟡🧨 **Review · #3**', report)
+        self.assertIn('Attention ranks review care from changed files (🧨 Critical, 🔍 Careful, 📄 Standard, 🪶 Light).', report)
+        self.assertNotIn('🧨', q.render(snap, [action], [], 'detailed', merge))
 
 
 if __name__ == '__main__':

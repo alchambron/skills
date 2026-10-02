@@ -3,11 +3,20 @@
 import re
 
 PRIORITY = ('Low', 'Medium', 'High', 'Urgent')
+# Checkbox reports lead each entry with these so priority and attention read at a glance.
+PRIORITY_DOT = {'Urgent': '🔴', 'High': '🟠', 'Medium': '🟡', 'Low': '⚪'}
+ATTENTION_ICON = {'Critical': '🧨', 'Careful': '🔍', 'Standard': '📄', 'Light': '🪶'}
 ATTENTION = ('Light', 'Standard', 'Careful', 'Critical')
 LARGE_CODE_LINES = 2000
 MAX_JEV_PATHS = 200
 SECURITY_KINDS = ('security_fix', 'security_exposure')
 SUBJECT = 'This pull request, as described by its title, description, labels, and changed paths.'
+
+
+def icons(entry):
+    """Priority dot then attention icon, e.g. 🔴🔍."""
+    return PRIORITY_DOT[entry['priority']['level']] + ATTENTION_ICON[entry['attention']['level']]
+
 
 # First match wins. Tests precede everything, so a security test stays Light;
 # critical paths precede docs, so a production README still gets attention.

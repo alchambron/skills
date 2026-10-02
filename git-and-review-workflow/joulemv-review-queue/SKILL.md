@@ -107,26 +107,26 @@ Security readings below 0.5 rank as no. An unavailable judgment keeps the rule-b
 
 Attention is the highest tier among changed files, by the first-match path rules in `RULES`: **Critical** (SQL migrations, production deploy, backend auth/security), **Careful** (backend code, dependencies, frontend auth/permissions), **Standard** (frontend code, CI, scripts, unrecognized files), **Light** (tests, docs, skills and agent docs, translations, generated files, review config). Non-Light changes of 2000 lines or more raise Standard or Careful one tier. A truncated file list makes attention provisional. Change tiers in `RULES`, not in prose; the report names the reasons behind each level.
 
-**Verify security before returning the report.** `merge.json` lists in `verify` every PR rated from a security fix and every possible security fix; an `Urgent Ticket` label needs no verification and stays Urgent. For each, read the description and `gh pr diff NUMBER --repo EnerZam/JouleMV`, then decide whether the PR closes a real weakness and whether deployed code exposes it. Edit the report so each verified priority matches the evidence, append `agent verified` to it, and move any PR now rated Urgent or High into the Merge priority section. Verification is complete when every `verify` PR is confirmed or re-rated. A verified priority is still a triage judgment, not a security audit.
+**Verify security before returning the report.** `merge.json` lists in `verify` every PR rated from a security fix and every possible security fix; an `Urgent Ticket` label needs no verification and stays Urgent. For each, read the description and `gh pr diff NUMBER --repo EnerZam/JouleMV`, then decide whether the PR closes a real weakness and whether deployed code exposes it. Edit the report so each verified priority and its leading priority dot match the evidence, append `agent verified` to it, update the per-level counts, and move any PR now rated Urgent or High into the Merge priority section. Verification is complete when every `verify` PR is confirmed or re-rated. A verified priority is still a triage judgment, not a security audit.
 
 ## Teams-ready report
 
-Return the message itself, ready to copy into Microsoft Teams. Use bold report and owner headings, `- [ ]` checkboxes with bold action and PR number, a separate progress/detail line, blank lines between actions, and one full PR URL per action on its own line. The checkbox report omits discussion links and routine unknown-check text. Avoid Markdown tables, code fences, nested lists, HTML, and introductory commentary outside the message. Write in the user's language. A plain name or GitHub login is a label, not a working Teams mention.
+Return the message itself, ready to copy into Microsoft Teams. Use bold report and owner headings, `- [ ]` checkboxes led by the priority dot (🔴 Urgent, 🟠 High, 🟡 Medium, ⚪ Low) and attention icon (🧨 Critical, 🔍 Careful, 📄 Standard, 🪶 Light) with bold action and PR number, a separate progress/detail line, blank lines between actions, and one full PR URL per action on its own line. The checkbox report omits discussion links and routine unknown-check text. Avoid Markdown tables, code fences, nested lists, HTML, and introductory commentary outside the message. Write in the user's language. A plain name or GitHub login is a label, not a working Teams mention.
 
 Start with `JouleMV review actions` and collection date/time/timezone, then a short count of unique PRs and people with pending actions. Show average estimated progress for unique included non-draft PRs only, with its denominator. This is progress of the action queue, not the whole repository. Never double-count a PR listed under multiple people. Use `N/A` when the denominator is zero; label partial data and its coverage explicitly.
 
-After the header and coverage lines, show **Merge priority · security first**: every non-draft Urgent and High PR, including PRs without pending human actions, with its reason, attention, next action or approval count, blockers, and PR link. Follow it with the unclear-security list and counts per priority level.
+After the header and coverage lines, show **Merge priority · security first**: every non-draft Urgent and High PR, led by its priority dot and attention icon and including PRs without pending human actions, with its reason, attention, next action or approval count, blockers, and PR link. Follow it with the unclear-security list and counts per priority level, each count led by its dot.
 
 Group only people who currently owe an action. Sort each person's entries by merge priority (Urgent, High, Medium, Low), then responses to human feedback before reviews, then oldest waiting first. After security verification re-rates an entry, move it to its new priority position. Deduplicate person/PR/action entries. Use this shape, replacing placeholders with live evidence:
 
 **Person name / GitHub login**
 
-- [ ] **Respond to human review · #NUMBER** — PR title  
+- [ ] 🟡🧨 **Respond to human review · #NUMBER** — PR title  
   **30%** · Pass 1. Address REVIEWER's feedback about TOPIC.  
   Priority **Medium** (bug fix) · Attention **Critical** (SQL migration).  
   FULL_PR_URL
 
-- [ ] **Review · #NUMBER** — PR title  
+- [ ] ⚪🪶 **Review · #NUMBER** — PR title  
   **50%** · Pass 2. Re-review the author's fixes.  
   Priority **Low** (docs, skills, or tests only) · Attention **Light** (skills and agent docs).  
   FULL_PR_URL
