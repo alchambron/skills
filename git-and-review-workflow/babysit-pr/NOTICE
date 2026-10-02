@@ -1,0 +1,10 @@
+OpenAI Codex
+Copyright 2025 OpenAI
+
+This project includes code derived from [Ratatui](https://github.com/ratatui/ratatui), licensed under the MIT license.
+Copyright (c) 2016-2022 Florian Dehau
+Copyright (c) 2023-2025 The Ratatui Developers
+
+Local babysit-pr adaptation from openai/codex commit 5e96aabd68dc6194f5ad928cb7f5d0bc71b72df9.
+SKILL.md, agents/openai.yaml, references/heuristics.md, scripts/gh_pr_watch.py,
+and scripts/test_gh_pr_watch.py were modified for global use and watcher correctness.

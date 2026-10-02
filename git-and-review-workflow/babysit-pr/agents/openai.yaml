@@ -1,0 +1,4 @@
+interface:
+  display_name: "PR Babysitter"
+  short_description: "Monitor PR checks, review feedback, and conflicts"
+  default_prompt: "Use $babysit-pr to watch this PR, diagnose blockers, and apply authorized fixes while continuing to monitor."
