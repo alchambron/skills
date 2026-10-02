@@ -117,7 +117,7 @@ Start with `JouleMV review actions` and collection date/time/timezone, then a sh
 
 After the header and coverage lines, show **Merge priority · security first**: every non-draft Urgent and High PR, including PRs without pending human actions, with its reason, attention, next action or approval count, blockers, and PR link. Follow it with the unclear-security list and counts per priority level.
 
-Group only people who currently owe an action. Sort responses to human feedback first, then reviews, oldest waiting first within each action. Deduplicate person/PR/action entries. Use this shape, replacing placeholders with live evidence:
+Group only people who currently owe an action. Sort each person's entries by merge priority (Urgent, High, Medium, Low), then responses to human feedback before reviews, then oldest waiting first. After security verification re-rates an entry, move it to its new priority position. Deduplicate person/PR/action entries. Use this shape, replacing placeholders with live evidence:
 
 **Person name / GitHub login**
 

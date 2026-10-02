@@ -637,7 +637,9 @@ def render(snapshot, actions, uncertainties, format_style='checkbox', merge=None
             lines.extend([f'**{owner}**', ''])
         else:
             lines.extend(['', owner])
-        for a in sorted((a for a in actions if a['owner'] == owner), key=lambda a: (a['action'] != 'Respond to human review', a['at'], a['pr'])):
+        # Highest merge priority first; unrated entries sort last.
+        rank = lambda a: signals.PRIORITY[::-1].index(merge[a['pr']]['priority']['level']) if a['pr'] in merge else len(signals.PRIORITY)
+        for a in sorted((a for a in actions if a['owner'] == owner), key=lambda a: (rank(a), a['action'] != 'Respond to human review', a['at'], a['pr'])):
             pr = prs[a['pr']]
             blocker = ' Merge conflict.' if pr.get('mergeable') == 'CONFLICTING' else ''
             checks = pr.get('required_checks')

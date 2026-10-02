@@ -138,6 +138,25 @@ class Report(unittest.TestCase):
         merge = signals.assess(snap, [{'id': '4:priority:security_fix', 'suggestion': 'uncertain', 'probability_yes': 0.7}])
         self.assertIn('Security effect unclear, verify: #4.', q.render(snap, [], [], 'checkbox', merge))
 
+    def test_each_persons_entries_sort_by_priority_before_action_and_age(self):
+        low = pr(['docs/a.md'], number=1)
+        medium = pr(['frontend/src/a.ts'], title='fix: Repair', number=2)
+        urgent = pr(['src/main/java/A.java'], labels=['Urgent Ticket'], number=3)
+        high = pr(['src/main/java/B.java'], number=4)
+        snap = self.snapshot(low, medium, urgent, high)
+        judgments = {**judged(1), **judged(2), **judged(3), **judged(4, fix='yes')}
+        merge = signals.assess(snap, [{'id': k, **v} for k, v in judgments.items()])
+        def action(number, kind, at):
+            return {'pr': number, 'owner': 'reviewer', 'action': kind, 'at': at, 'detail': 'D.',
+                    'score': 10, 'stage_score': 10, 'pass_label': 'pass 1', 'draft': False}
+        actions = [action(1, 'Respond to human review', '2026-01-01'), action(2, 'Review', '2026-01-01'),
+                   action(4, 'Review', '2026-01-02'), action(3, 'Review', '2026-01-03'),
+                   action(2, 'Respond to human review', '2026-01-02')]
+        report = q.render(snap, actions, [], 'checkbox', merge).split('**reviewer**')[1]
+        order = [line.split('· #')[1].split('**')[0] for line in report.splitlines() if line.startswith('- [ ]')]
+        self.assertEqual(order, ['3', '4', '2', '2', '1'])
+        self.assertLess(report.index('**Respond to human review · #2**'), report.index('**Review · #2**'))
+
     def test_action_entries_carry_priority_and_attention(self):
         value = pr(['src/main/sql/update-tenant.sql'], title='fix(charts): Migrate results', number=3)
         snap = self.snapshot(value)
