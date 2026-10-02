@@ -63,6 +63,16 @@ PREDICATES = {
         "The message clearly assigns this fix or response to the specified person.",
         "The person is only an assignee, author, past participant, or requested reviewer without explicit fix ownership.",
     ),
+    "security_fix": (
+        "Does this pull request fix, mitigate, or harden against a security weakness?",
+        "The title, description, labels, or changed paths show it closes or reduces a weakness such as unauthorized access, authentication or permission bypass, cross-tenant data exposure, injection, secret or credential exposure, unsafe input handling, or a vulnerable dependency.",
+        "It is a feature, refactor, functional bug fix, documentation, tooling, or test change with no stated or evident security effect; merely touching security-related files is not enough.",
+    ),
+    "security_exposure": (
+        "Is the security weakness this pull request addresses reachable in the currently deployed base branch, so it could be exploited or is exposing data now?",
+        "The weakness exists in released code and an attacker, unauthorized user, or other tenant can reach it today, or data is currently exposed.",
+        "There is no security weakness, the change is precautionary hardening, the weakness exists only in unreleased code, or exploiting it requires access that already grants the same impact.",
+    ),
 }
 
 

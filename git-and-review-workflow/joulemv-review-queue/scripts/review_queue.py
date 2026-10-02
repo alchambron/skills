@@ -14,6 +14,7 @@ import time
 import tempfile
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
+import merge_signals as signals
 import typesafe_triage as jev
 
 REPO = 'EnerZam/JouleMV'
@@ -23,9 +24,10 @@ CONNECTIONS = {
     'reviews': f'id {ACTOR} body updatedAt submittedAt state url commit {{ oid }}',
     'comments': COMMENT,
     'reviewRequests': 'requestedReviewer { __typename ... on User { login } ... on Team { slug } }',
-    'commits': 'commit { oid committedDate }',
+    'commits': 'commit { oid committedDate parents { totalCount } }',
     'timelineItems': '... on ReviewRequestedEvent { createdAt requestedReviewer { __typename ... on User { login } ... on Team { slug } } }',
     'reviewThreads': f'id isResolved isOutdated comments(first:100) {{ pageInfo {{ hasNextPage endCursor }} nodes {{ {COMMENT} pullRequestReview {{ id }} }} }}',
+    'files': 'path additions deletions changeType',
 }
 
 
@@ -69,7 +71,8 @@ class GitHub:
 
     def pr_fields(self):
         fields = ' '.join(f'{name}(first:100) {{ pageInfo {{ hasNextPage endCursor }} nodes {{ {self.evidence_fields(node)} }} }}' for name, node in CONNECTIONS.items())
-        return 'number title url isDraft headRefOid baseRefName updatedAt mergeable reviewDecision author { login __typename } ' + fields
+        return ('number title url description: body createdAt isDraft headRefOid baseRefName updatedAt mergeable reviewDecision changedFiles '
+                'labels(first:50) { nodes { name } } author { login __typename } ' + fields)
 
     def initial_batch(self, items):
         selections = ' '.join(f'p{item["number"]}: pullRequest(number:{item["number"]}) {{ {self.pr_fields()} }}' for item in items)
@@ -260,7 +263,7 @@ def author_handoff_pending(pr, reviewer, feedback_at):
 
 def mentioned_people(body):
     prose = re.sub(r'```[^\n]*\n[\s\S]*?```|`[^`]*`', '', body)
-    return set(re.findall(r'(?<![A-Za-z0-9_./])@([A-Za-z0-9-]+)(?![A-Za-z0-9-]|\s*\()', prose))
+    return set(re.findall(r'(?<![A-Za-z0-9_./])@([A-Za-z0-9-]+)(?![A-Za-z0-9/-]|\s*\()', prose))
 
 
 def prepare(snapshot):
@@ -291,7 +294,8 @@ def prepare(snapshot):
                     events[raw['id']] = event(raw, thread=thread['id'], resolved=thread['isResolved'])
                 if not thread['isResolved'] and human(raw.get('author')) and raw['body'].strip():
                     if bot_root:
-                        candidates.append((raw, 'adoption'))
+                        if raw['author']['login'] != author:
+                            candidates.append((raw, 'adoption'))
                     elif raw['author']['login'] != author:
                         candidates.append((raw, 'feedback'))
         timeline = sorted(events.values(), key=lambda e: (e['at'], e['id']))
@@ -357,25 +361,49 @@ def approval_count(snapshot, pr):
     return sum(r['state'] == 'APPROVED' and (not stale or (r.get('commit') or {}).get('oid') == pr['headRefOid']) for r in effective_reviews(pr).values())
 
 
+def revision_dates(pr):
+    """Map each commit to its latest author revision; merge commits only bring in the base."""
+    revisions, latest = {}, ''
+    for c in sorted(pr['commits'], key=lambda c: c['commit'].get('committedDate') or ''):
+        commit = c['commit']
+        if (commit.get('parents') or {}).get('totalCount', 1) <= 1:
+            latest = max(latest, commit.get('committedDate') or '')
+        revisions[commit['oid']] = latest
+    return revisions, latest
+
+
+def review_rounds(pr):
+    """Human reviews that assess a revision; a lone thread reply is not a round."""
+    roots = {(t['comments'][0].get('pullRequestReview') or {}).get('id') for t in pr['reviewThreads'] if t['comments']}
+    author = (pr.get('author') or {}).get('login')
+    return sorted((r for r in pr['reviews'] if human(r.get('author')) and r['author']['login'] != author
+                   and r['state'] != 'PENDING' and (r['state'] != 'COMMENTED' or (r.get('body') or '').strip() or r['id'] in roots)),
+                  key=lambda r: r.get('submittedAt') or '')
+
+
 def review_pass(pr):
-    """Count only feedback -> later revision -> renewed human review transitions."""
-    commits = {c['commit']['oid']: c['commit']['committedDate'] for c in pr['commits']}
-    reviews = sorted((r for r in pr['reviews'] if human(r.get('author')) and r['author']['login'] != (pr.get('author') or {}).get('login') and r['state'] != 'PENDING'), key=lambda r:r.get('submittedAt') or '')
+    """Count only feedback -> later revision -> renewed human review transitions.
+
+    Also report whether the latest revision is the one the current pass assessed,
+    so an awaited re-review joins that pass rather than starting another."""
+    revisions, latest = revision_dates(pr)
+    reviews = review_rounds(pr)
     pass_number, feedback_at, revision_at = 1, None, ''
+    pass_revision = revisions.get((reviews[0].get('commit') or {}).get('oid'), '') if reviews else ''
     for r in reviews:
-        date = commits.get((r.get('commit') or {}).get('oid'), '')
+        date = revisions.get((r.get('commit') or {}).get('oid'), '')
         if feedback_at and date > feedback_at and date > revision_at and (r.get('submittedAt') or '') >= date:
             pass_number += 1
-            revision_at, feedback_at = date, None
+            revision_at, feedback_at, pass_revision = date, None, date
         if r['state'] == 'CHANGES_REQUESTED':
             feedback_at = r.get('submittedAt') or feedback_at
-    return pass_number, bool(reviews)
+    return pass_number, bool(reviews), bool(latest) and pass_revision >= latest
 
 
-def collect_checks(snapshot, actions, workers):
+def collect_checks(snapshot, actions, workers, extra=()):
     gh = GitHub()
     start = time.perf_counter()
-    numbers = sorted({a['pr'] for a in actions})
+    numbers = sorted({a['pr'] for a in actions} | set(extra))
     def fetch(number):
         try:
             checks = gh.command('pr', 'checks', str(number), '--repo', REPO, '--required', '--json', 'name,state,bucket,link', acceptable=(0,1,8))
@@ -411,6 +439,8 @@ def compose(snapshot, obligations, judgments):
         handoff = handoff_pending and any(status(cid) == 'yes' for cid in ob['handoffs'])
         request_at = current_request_at(pr, ob['reviewer'])
         formal_handoff = bool(request_at and request_at > ob['at'])
+        if handoff and pr['isDraft'] and not formal_handoff:
+            continue
         if handoff or formal_handoff:
             actions.append({'pr': ob['pr'], 'owner': ob['reviewer'], 'action': 'Review', 'at': request_at or ob['at'], 'detail': 'Re-review fixes' + (' (inferred handoff).' if handoff and not formal_handoff else '.'), 'evidence': ob['url'], 'rereview': True})
             continue
@@ -459,8 +489,10 @@ def compose(snapshot, obligations, judgments):
                 continue
             if actor.get('__typename') == 'Team':
                 eligible_requests.append(owner)
-            actions.append({'pr': pr['number'], 'owner': owner, 'action': 'Review',
-                            'at': current_request_at(pr, owner) or pr['updatedAt'], 'detail': 'Review requested.'})
+            again = actor.get('__typename') != 'Team' and bool(latest_review_at(pr, owner))
+            actions.append({'pr': pr['number'], 'owner': owner, 'action': 'Review', 'rereview': again,
+                            'at': current_request_at(pr, owner) or pr['updatedAt'],
+                            'detail': 'Re-review requested.' if again else 'Review requested.'})
         count, known = required_count(snapshot, pr)
         approvals = approval_count(snapshot, pr)
         if (not pr['isDraft'] and not eligible_requests and count > approvals and not present
@@ -468,15 +500,20 @@ def compose(snapshot, obligations, judgments):
             actions.append({'pr': pr['number'], 'owner': 'Reviewer needed', 'action': 'Review', 'at': pr['updatedAt'], 'detail': 'Required human review has no named reviewer.'})
         if not known and not count and not present and not eligible_requests:
             uncertainties.append({'pr': pr['number'], 'evidence': pr['url'], 'reason': 'Cannot verify all required-review rules.'})
+    blocked = {(a['pr'], a.get('reviewer')) for a in actions if a['action'] == 'Respond to human review'}
     dedup = {}
     for a in actions:
         key = (a['pr'], a['owner'], a['action'])
         if key not in dedup:
-            dedup[key] = a
-        elif a.get('rereview'):
-            dedup[key]['rereview'] = True
+            dedup[key] = dict(a, reviewers=[a['reviewer']] if a.get('reviewer') else [])
+            continue
+        kept = dedup[key]
+        kept['rereview'] = kept.get('rereview') or a.get('rereview')
+        if a.get('reviewer') and a['reviewer'] not in kept['reviewers']:
+            kept['reviewers'].append(a['reviewer'])
+            confirm = ', or confirm fixes and request re-review' if 'confirm fixes' in kept['detail'] + a['detail'] else ''
+            kept['detail'] = f'Address feedback from {" and ".join(kept["reviewers"])}{confirm}.'
     actions = list(dedup.values())
-    blocked = {(a['pr'], a.get('reviewer')) for a in actions if a['action'] == 'Respond to human review'}
     blocked.update((u['pr'], u.get('reviewer')) for u in uncertainties if u.get('reviewer'))
     actions = [a for a in actions if a['action'] != 'Review' or (a['pr'], a['owner']) not in blocked]
     for pr in snapshot['prs']:
@@ -486,11 +523,18 @@ def compose(snapshot, obligations, judgments):
         # Conservative lower bound: do not turn reviewer count or commit count into passes.
         response = any(a['action'] == 'Respond to human review' for a in items)
         rereview = any(a.get('rereview') for a in items)
-        pass_number, has_history = review_pass(pr)
-        score = (30 if pass_number == 1 else 60 if pass_number == 2 else 75) if response else (50 if pass_number == 1 else 70) if rereview else 80 if approval_count(snapshot, pr) else 10
+        pass_number, has_history, current_reviewed = review_pass(pr)
+        awaited = pass_number if current_reviewed else pass_number + 1
+        approvals, (required, _) = approval_count(snapshot, pr), required_count(snapshot, pr)
+        if response:
+            score = 30 if pass_number == 1 else 60 if pass_number == 2 else 75
+        elif rereview:
+            score = 50 if awaited <= 2 else 70
+        else:
+            score = 90 if approvals and approvals >= required else 80 if approvals else 10
         pass_label = f'at least pass {pass_number}; conservative' if has_history else 'pass 1'
         if rereview and not response:
-            pass_label = f'at least pass {pass_number + 1}; conservative'
+            pass_label = f'at least pass {awaited}; conservative'
         if pr['isDraft']:
             score = 0
         stage_score = score
@@ -503,7 +547,55 @@ def compose(snapshot, obligations, judgments):
     return actions, uncertainties
 
 
-def render(snapshot, actions, uncertainties, format_style='checkbox'):
+def blockers(pr):
+    found = ['merge conflict'] if pr.get('mergeable') == 'CONFLICTING' else []
+    checks = pr.get('required_checks') or []
+    if any(c.get('bucket') in ('fail', 'cancel') for c in checks):
+        found.append('required checks failed')
+    elif any(c.get('bucket') == 'pending' for c in checks):
+        found.append('required checks pending')
+    return found
+
+
+def priority_section(snapshot, actions, merge, format_style):
+    """Urgent and High non-draft PRs, including ones with no pending human action."""
+    prs = {p['number']: p for p in snapshot['prs']}
+    rank = {level: index for index, level in enumerate(reversed(signals.PRIORITY))}
+    top = sorted((n for n, m in merge.items() if not prs[n]['isDraft'] and m['priority']['level'] in ('Urgent', 'High')),
+                 key=lambda n: (rank[merge[n]['priority']['level']], n))
+    checkbox = format_style == 'checkbox'
+    lines = ['**Merge priority · security first**' if checkbox else 'Merge priority (security first):', '']
+    if not top:
+        lines.extend(['No Urgent or High merge priorities found.', ''])
+    for number in top:
+        pr, entry = prs[number], merge[number]
+        nexts = sorted({'reviewer needed' if a['owner'] == 'Reviewer needed'
+                        else f'{a["action"]} by {a["owner"].replace("Team review requested: ", "team ")}'
+                        for a in actions if a['pr'] == number})
+        if nexts:
+            state = 'Next: ' + '; '.join(nexts) + '.'
+        else:
+            count, _ = required_count(snapshot, pr)
+            state = f'No pending human review action; {approval_count(snapshot, pr)}/{count} required approvals.'
+        found = blockers(pr)
+        if found:
+            state += (' **Blocker:** ' if checkbox else ' Blocker: ') + ', '.join(found) + '.'
+        if checkbox:
+            lines.extend([f'- **{entry["priority"]["level"]} · #{number}** — {pr["title"]}  ',
+                          f'  {signals.summary(entry, level=False)}  ', f'  {state}  ', f'  {pr["url"]}', ''])
+        else:
+            lines.extend([f'• {entry["priority"]["level"]}: #{number}, {pr["title"]}. {signals.summary(entry, markdown=False, level=False)} {state}', pr['url']])
+    verify = sorted(n for n, m in merge.items() if not prs[n]['isDraft'] and m['priority']['security_fix'] == 'uncertain')
+    if verify:
+        lines.extend(['Security effect unclear, verify: ' + ', '.join(f'#{n}' for n in verify) + '.', ''])
+    counts = {level: sum(not prs[n]['isDraft'] and m['priority']['level'] == level for n, m in merge.items())
+              for level in signals.PRIORITY}
+    lines.append(' · '.join(f'{level} {counts[level]}' for level in reversed(signals.PRIORITY)) + ' (non-draft PRs)')
+    return lines
+
+
+def render(snapshot, actions, uncertainties, format_style='checkbox', merge=None):
+    merge = merge or {}
     prs = {p['number']: p for p in snapshot['prs']}
     scores = {a['pr']: a['score'] for a in actions if not a['draft']}
     people = {a['owner'] for a in actions if a['owner'] != 'Reviewer needed' and not a['owner'].startswith('Team review requested:')}
@@ -520,12 +612,24 @@ def render(snapshot, actions, uncertainties, format_style='checkbox'):
         label = '**Partial collection:**' if format_style == 'checkbox' else 'Partial collection:'
         lines.append(f'{label} {len(snapshot["prs"])}/{snapshot["open_count"]} open PRs; ' + '; '.join(snapshot['errors']))
     interpretation = snapshot.get('interpretation_metrics') or {}
-    if interpretation.get('unavailable_cases'):
+    # Older snapshots carry only aggregate counts, which were all feedback cases.
+    unavailable = interpretation.get('feedback_unavailable', interpretation.get('unavailable_cases'))
+    if unavailable:
         label = '**Partial interpretation:**' if format_style == 'checkbox' else 'Partial interpretation:'
-        lines.append(f'{label} {interpretation["unavailable_cases"]}/{interpretation["cases"]} judgments unavailable; '
+        lines.append(f'{label} {unavailable}/{interpretation.get("feedback_cases", interpretation.get("cases"))} judgments unavailable; '
                      'affected feedback and next actions require verification.')
+    if interpretation.get('priority_unavailable'):
+        label = '**Partial security assessment:**' if format_style == 'checkbox' else 'Partial security assessment:'
+        lines.append(f'{label} {interpretation["priority_unavailable"]}/{interpretation["priority_cases"]} judgments unavailable; '
+                     'affected priorities say so.')
+    if merge:
+        if lines[-1]:
+            lines.append('')
+        lines.extend(priority_section(snapshot, actions, merge, format_style))
     if not actions:
-        lines.append('No confirmed pending human review actions found.' if uncertainties or interpretation.get('unavailable_cases') else 'No pending human review actions found.')
+        if lines[-1]:
+            lines.append('')
+        lines.append('No confirmed pending human review actions found.' if uncertainties or unavailable else 'No pending human review actions found.')
     for owner in sorted({a['owner'] for a in actions}, key=str.lower):
         if format_style == 'checkbox':
             if lines[-1]:
@@ -554,9 +658,12 @@ def render(snapshot, actions, uncertainties, format_style='checkbox'):
                     blocker = blocker.replace(' Merge conflict.', ' **Blocker:** merge conflict.').replace(' Required checks failed.', ' **Blocker:** required checks failed.')
                 title = f'- [ ] **{a["action"]} · #{a["pr"]}** — {pr["title"]}  '
                 status = f'  **{a["score"]}%** · {pass_label}.' + (' Draft.' if a['draft'] else '') + ' ' + detail + blocker + '  '
-                lines.extend([title, status, f'  {pr["url"]}', ''])
+                signal = [f'  {signals.summary(merge[a["pr"]])}  '] if a['pr'] in merge else []
+                lines.extend([title, status, *signal, f'  {pr["url"]}', ''])
             else:
                 entry = f'• {a["action"]}: #{a["pr"]}, {pr["title"]}. {a["pass_label"]}, {a["score"]}%.' + (' Draft.' if a['draft'] else '') + ' ' + detail + blocker
+                if a['pr'] in merge:
+                    entry += ' ' + signals.summary(merge[a['pr']], markdown=False)
                 lines.extend([entry, pr['url']])
             if format_style == 'detailed' and a.get('evidence') and a['evidence'] != pr['url']:
                 lines.append(a['evidence'])
@@ -576,6 +683,9 @@ def render(snapshot, actions, uncertainties, format_style='checkbox'):
             else:
                 lines.append('')
     footer = 'Percentages estimate workflow progress conservatively; later confirmed human passes advance the score, subject to merge blockers. Detailed merge gates are not certified.'
+    if merge:
+        footer += (' Priority ranks merge urgency, security first (Urgent, High, Medium, Low);'
+                   ' Attention ranks review care from changed files (Critical, Careful, Standard, Light).')
     if lines[-1]:
         lines.append('')
     lines.append(f'*{footer}*' if format_style == 'checkbox' else footer)
@@ -601,25 +711,33 @@ def main():
         args.cache_dir / 'github-bodies.json' if args.cache_dir and not args.full_collection else None)
     write_json(args.output / 'snapshot.json', snapshot)
     cases, obligations = prepare(snapshot)
-    write_json(args.output / 'cases.json', cases)
+    security_cases = [c for pr in snapshot['prs'] for c in signals.priority_cases(pr)]
+    write_json(args.output / 'cases.json', cases + security_cases)
     write_json(args.output / 'obligations.json', obligations)
     if args.collect_only:
-        print(json.dumps({'open_prs':snapshot['open_count'], 'cases':len(cases), **snapshot['collection_metrics']}))
+        print(json.dumps({'open_prs':snapshot['open_count'], 'cases':len(cases), 'security_cases':len(security_cases), **snapshot['collection_metrics']}))
         return
-    payloads = [jev.build_payload(c, args.model) for c in cases]
+    payloads = [jev.build_payload(c, args.model) for c in cases + security_cases]
     output = jev.evaluate(payloads, os.environ.get('TYPESAFE_API_KEY'), min(args.workers, 4), args.cache_dir)
-    snapshot['interpretation_metrics'] = output['metrics']
-    actions, uncertainties = compose(snapshot, obligations, output['results'])
+    feedback_results, security_results = output['results'][:len(cases)], output['results'][len(cases):]
+    snapshot['interpretation_metrics'] = {**output['metrics'],
+        'feedback_cases': len(cases), 'feedback_unavailable': sum(r['suggestion'] == 'unavailable' for r in feedback_results),
+        'priority_cases': len(security_cases), 'priority_unavailable': sum(r['suggestion'] == 'unavailable' for r in security_results)}
+    merge = signals.assess(snapshot, security_results)
+    actions, uncertainties = compose(snapshot, obligations, feedback_results)
     checks_metrics = None
     if not args.snapshot:
-        checks_metrics = collect_checks(snapshot, actions, args.workers)
+        urgent = [n for n, m in merge.items() if m['priority']['level'] in ('Urgent', 'High')]
+        checks_metrics = collect_checks(snapshot, actions, args.workers, urgent)
         write_json(args.output / 'snapshot.json', snapshot)
-        actions, uncertainties = compose(snapshot, obligations, output['results'])
+        actions, uncertainties = compose(snapshot, obligations, feedback_results)
     else:
         write_json(args.output / 'snapshot.json', snapshot)
-    report = render(snapshot, actions, uncertainties, args.format_style)
+    report = render(snapshot, actions, uncertainties, args.format_style, merge)
     write_json(args.output / 'judgments.json', output)
     write_json(args.output / 'actions.json', {'actions':actions, 'uncertainties':uncertainties})
+    write_json(args.output / 'merge.json', {'verify': sorted(n for n, m in merge.items() if signals.needs_verification(m)),
+                                            'prs': {str(n): m for n, m in merge.items()}})
     (args.output / 'report.txt').write_text(report)
     metrics = {'total_seconds':round(time.perf_counter()-start,3), 'snapshot_replay':bool(args.snapshot),
                'github': None if args.snapshot else snapshot['collection_metrics'], 'checks':checks_metrics, 'jev':output['metrics'],

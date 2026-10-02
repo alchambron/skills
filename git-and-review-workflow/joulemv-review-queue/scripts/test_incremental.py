@@ -132,7 +132,9 @@ class BodyCacheTests(unittest.TestCase):
 
     def test_metadata_query_keeps_freshness_fields(self):
         fields = queue.GitHub(incremental=True).pr_fields()
-        self.assertNotIn(' body ', fields)
+        # The PR description feeds merge priority and is always refetched; discussion text is not.
+        self.assertIn('description: body ', fields)
+        self.assertNotIn(' body ', fields.replace('description: body ', ''))
         for expected in ('updatedAt', 'isResolved', 'reviewRequests', 'commits', 'pageInfo'):
             self.assertIn(expected, fields)
 
