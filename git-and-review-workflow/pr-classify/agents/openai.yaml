@@ -1,0 +1,4 @@
+interface:
+  display_name: "PR Classify"
+  short_description: "Classify PRs with optional ticket references"
+  default_prompt: "Use $pr-classify to propose a type, scope, risk, title, and description for these changes."
