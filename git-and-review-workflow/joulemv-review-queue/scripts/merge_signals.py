@@ -33,7 +33,7 @@ ORDER = {label: index for index, (_, label, _) in enumerate(RULES)}
 # Jev's 0.9/0.1 bands suit task ownership; for ranking, a coin-flip or better
 # security reading is worth an agent check, and a lower one ranks as no.
 POSSIBLE = 0.5
-URGENT_LABEL = re.compile(r'urgent', re.I)
+URGENT_LABEL = 'urgent ticket'
 BUG = re.compile(r'^(fix|hotfix)(\(|!|:)|\bJMV-B-\d+', re.I)
 
 
@@ -96,12 +96,13 @@ def priority(pr, merge_attention, judgments):
     notes = []
     if fix == 'yes' and exposed == 'yes':
         level, reason = 'Urgent', 'security fix, weakness live now'
+    elif any(name.strip().lower() == URGENT_LABEL for name in labels):
+        # The team's label is authoritative; no security reading can lower it.
+        level, reason = 'Urgent', 'urgent ticket' + (', security fix' if fix == 'yes' else '')
     elif fix == 'yes':
         level, reason = 'High', 'security fix'
         if exposed != 'no':
             notes.append('verify whether the weakness is live')
-    elif any(URGENT_LABEL.search(name) for name in labels):
-        level, reason = 'High', 'urgent ticket'
     elif fix == 'uncertain':
         level, reason = 'Medium', 'possible security fix'
     elif BUG.search(pr['title']) and runtime:
@@ -126,7 +127,7 @@ def assess(snapshot, judgments):
 
 def needs_verification(entry):
     p = entry['priority']
-    return p['level'] == 'Urgent' or p['reason'] == 'security fix' or p['security_fix'] == 'uncertain'
+    return p['reason'].startswith('security fix') or p['security_fix'] == 'uncertain'
 
 
 def summary(entry, markdown=True, level=True):

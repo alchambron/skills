@@ -98,8 +98,8 @@ Each PR gets two separate ratings. **Priority** is how soon merging helps the pr
 
 | Priority | Rule |
 | --- | --- |
-| Urgent | Security fix whose weakness is live now. |
-| High | Security fix without confirmed live exposure, or an `Urgent Ticket` label. |
+| Urgent | `Urgent Ticket` label on the PR, or a security fix whose weakness is live now. |
+| High | Security fix without confirmed live exposure. |
 | Medium | `possible security fix` (Jev reading of 0.5 or more, not decisive), or a bug fix (`fix`/`hotfix` title or `JMV-B-` ticket) touching non-Light files. |
 | Low | Features, maintenance, and PRs touching only Light files. |
 
@@ -107,7 +107,7 @@ Security readings below 0.5 rank as no. An unavailable judgment keeps the rule-b
 
 Attention is the highest tier among changed files, by the first-match path rules in `RULES`: **Critical** (SQL migrations, production deploy, backend auth/security), **Careful** (backend code, dependencies, frontend auth/permissions), **Standard** (frontend code, CI, scripts, unrecognized files), **Light** (tests, docs, skills and agent docs, translations, generated files, review config). Non-Light changes of 2000 lines or more raise Standard or Careful one tier. A truncated file list makes attention provisional. Change tiers in `RULES`, not in prose; the report names the reasons behind each level.
 
-**Verify security before returning the report.** `merge.json` lists in `verify` every Urgent PR, every High rated from a security fix, and every possible security fix. For each, read the description and `gh pr diff NUMBER --repo EnerZam/JouleMV`, then decide whether the PR closes a real weakness and whether deployed code exposes it. Edit the report so each verified priority matches the evidence, append `agent verified` to it, and move any PR now rated Urgent or High into the Merge priority section. Verification is complete when every `verify` PR is confirmed or re-rated. A verified priority is still a triage judgment, not a security audit.
+**Verify security before returning the report.** `merge.json` lists in `verify` every PR rated from a security fix and every possible security fix; an `Urgent Ticket` label needs no verification and stays Urgent. For each, read the description and `gh pr diff NUMBER --repo EnerZam/JouleMV`, then decide whether the PR closes a real weakness and whether deployed code exposes it. Edit the report so each verified priority matches the evidence, append `agent verified` to it, and move any PR now rated Urgent or High into the Merge priority section. Verification is complete when every `verify` PR is confirmed or re-rated. A verified priority is still a triage judgment, not a security audit.
 
 ## Teams-ready report
 

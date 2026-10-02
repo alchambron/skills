@@ -70,9 +70,14 @@ class Priority(unittest.TestCase):
         self.assertEqual(result['level'], 'High')
         self.assertIn('verify whether the weakness is live', result['notes'])
 
-    def test_urgent_label_is_high_without_security_claim(self):
+    def test_urgent_ticket_label_is_urgent_without_security_claim(self):
         result = self.rate(pr(['src/main/java/A.java'], labels=['Urgent Ticket']))
-        self.assertEqual((result['level'], result['reason']), ('High', 'urgent ticket'))
+        self.assertEqual((result['level'], result['reason']), ('Urgent', 'urgent ticket'))
+        self.assertFalse(signals.needs_verification({'priority': result}))
+        self.assertEqual(self.rate(pr(['docs/a.md'], labels=['urgent ticket']))['level'], 'Urgent')
+        both = self.rate(pr(['src/main/java/A.java'], labels=['Urgent Ticket']), judged(fix='yes'))
+        self.assertEqual((both['level'], both['reason']), ('Urgent', 'urgent ticket, security fix'))
+        self.assertEqual(self.rate(pr(['src/main/java/A.java'], labels=['Not urgent']))['level'], 'Low')
 
     def test_runtime_bug_fix_is_medium_and_docs_fix_is_low(self):
         self.assertEqual(self.rate(pr(['frontend/src/a.ts'], title='fix(charts): Repair axis'))['level'], 'Medium')
