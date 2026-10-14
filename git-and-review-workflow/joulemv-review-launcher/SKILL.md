@@ -5,6 +5,8 @@ description: Show my actionable JouleMV PR reviews, accept one, several, or all,
 
 # JouleMV review launcher
 
+For the complete review-and-live-test batch in the current thread, use [joulemv-review-all](../joulemv-review-all/SKILL.md). This launcher retains the separate-thread picker workflow.
+
 Use this skill from a T3 Code thread to launch selected reviews one at a time. This thread is the picker; each selected PR gets its own T3 Code thread and T3-managed worktree. Do not register an unselected PR with the picker thread.
 
 ## Show the user's review choices

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Review all my PRs"
+  short_description: "Review, publish findings, and live-test in one thread"
+  default_prompt: "Use $joulemv-review-all to review all PRs requesting my review in this thread, publish verified inline findings, and live-test the remaining PRs with guides and screenshots."
