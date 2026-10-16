@@ -1,0 +1,4 @@
+interface:
+  display_name: "JouleMV PR triage"
+  short_description: "Rank security fixes and quick PR reviews first"
+  default_prompt: "Use $joulemv-pr-triage to refresh and order the JouleMV pull requests needing review, with security and small changes first."
