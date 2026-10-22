@@ -1,0 +1,4 @@
+interface:
+  display_name: "Remote Preview"
+  short_description: "Lancer un projet et ouvrir son URL privée Tailscale"
+  default_prompt: "Utilise $remote-preview pour lancer ce projet et me donner son URL privée Tailscale."

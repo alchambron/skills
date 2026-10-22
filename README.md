@@ -1,6 +1,6 @@
 # Skills
 
-46 skills organized by purpose. Each skill folder includes its original instructions and supporting files. Some skills contain JouleMV conventions or depend on specific tools and services; see their `SKILL.md` for requirements.
+47 skills organized by purpose. Each skill folder includes its original instructions and supporting files. Some skills contain JouleMV conventions or depend on specific tools and services; see their `SKILL.md` for requirements.
 
 ## Categories
 
@@ -12,7 +12,7 @@
 | [Git and review workflow](git-and-review-workflow/) | Monitor pull requests, publish reviews, manage review queues, resolve conflicts, and ship changes | [babysit-pr](git-and-review-workflow/babysit-pr/SKILL.md), [github-inline-review](git-and-review-workflow/github-inline-review/SKILL.md), [joulemv-pr-sensitivity](git-and-review-workflow/joulemv-pr-sensitivity/SKILL.md), [joulemv-review-queue](git-and-review-workflow/joulemv-review-queue/SKILL.md), [joulemv-pr-triage](git-and-review-workflow/joulemv-pr-triage/SKILL.md), [respond](git-and-review-workflow/respond/SKILL.md), [resolving-merge-conflicts](git-and-review-workflow/resolving-merge-conflicts/SKILL.md), [yeet](git-and-review-workflow/yeet/SKILL.md), [pr-classify](git-and-review-workflow/pr-classify/SKILL.md), [code-review](git-and-review-workflow/code-review/SKILL.md), [joulemv-code-review](git-and-review-workflow/joulemv-code-review/SKILL.md), [joulemv-review-launcher](git-and-review-workflow/joulemv-review-launcher/SKILL.md), [joulemv-review-all](git-and-review-workflow/joulemv-review-all/SKILL.md) |
 | [Architecture and planning](architecture-and-planning/) | Clarify domain concepts, improve module boundaries, and challenge designs | [codebase-design](architecture-and-planning/codebase-design/SKILL.md), [domain-modeling](architecture-and-planning/domain-modeling/SKILL.md), [improve-codebase-architecture](architecture-and-planning/improve-codebase-architecture/SKILL.md), [grilling](architecture-and-planning/grilling/SKILL.md), [grill-with-docs](architecture-and-planning/grill-with-docs/SKILL.md) |
 | [Agent collaboration and writing](agent-collaboration-and-writing/) | Coordinate agents, write instructions, transfer context, improve prose, and guide human setup | [parallel-investigation](agent-collaboration-and-writing/parallel-investigation/SKILL.md), [delegated-implementation](agent-collaboration-and-writing/delegated-implementation/SKILL.md), [writing-for-agents](agent-collaboration-and-writing/writing-for-agents/SKILL.md), [handoff](agent-collaboration-and-writing/handoff/SKILL.md), [unslop](agent-collaboration-and-writing/unslop/SKILL.md), [wizard](agent-collaboration-and-writing/wizard/SKILL.md) |
-| [Personal workflows](personal-workflows/) | Create and troubleshoot running workouts | [coros-workouts](personal-workflows/coros-workouts/SKILL.md) |
+| [Personal workflows](personal-workflows/) | Manage running workouts and remote development previews | [coros-workouts](personal-workflows/coros-workouts/SKILL.md), [remote-preview](personal-workflows/remote-preview/SKILL.md) |
 
 ## Layout
 
@@ -73,4 +73,4 @@ For Claude Code, link the same skill into `~/.claude/skills/pr-classify` and add
 
 The descriptions in `dropdown-utils` and `figma-import` were quoted to fix YAML parsing without changing their wording. The `joulemv-review-all` repository copy uses category-relative links for its testing dependencies; its installed copy uses sibling skill links. All other skill files match their local sources.
 
-The bundled skill validator rejects existing `disable-model-invocation` metadata in `handoff`, `grill-with-docs`, and `improve-codebase-architecture`, plus `argument-hint` in `handoff`. These fields are preserved from the source skills. All 46 frontmatter blocks parse as YAML; 43 skills pass the bundled validator.
+The bundled skill validator rejects existing `disable-model-invocation` metadata in `handoff`, `grill-with-docs`, and `improve-codebase-architecture`, plus `argument-hint` in `handoff`. These fields are preserved from the source skills. All 47 frontmatter blocks parse as YAML; 44 skills pass the bundled validator.
