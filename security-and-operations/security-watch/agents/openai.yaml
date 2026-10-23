@@ -1,0 +1,4 @@
+interface:
+  display_name: "EnerZam Security Watch"
+  short_description: "Weekly vulnerability watch for JouleMV and WebSynco, EN and FR PDF"
+  default_prompt: "Use $security-watch to produce this week's EnerZam security watch report."

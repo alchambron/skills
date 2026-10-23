@@ -1,0 +1,4 @@
+interface:
+  display_name: "JouleMV PR Risk"
+  short_description: "Assess deployment impact and label JouleMV PRs"
+  default_prompt: "Use $joulemv-pr-risk to assess every open JouleMV PR and apply exactly one risk label."
