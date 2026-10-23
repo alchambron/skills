@@ -1,0 +1,3 @@
+interface:
+  display_name: "Respond to Unanswered PR Feedback"
+  short_description: "Delegate PR feedback analysis and authorized fixes"
