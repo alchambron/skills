@@ -9,7 +9,7 @@ Orchestrate the installed [respond skill](../respond/SKILL.md) for every matchin
 
 All PR analysis runs in child agents: feedback collection, per-comment dispositions, diagnosis, plans, reply drafts, and later CI/review investigations. Authorized fixes run in separate child phases. The parent discovers candidates, schedules work, aggregates results, verifies returned heads, publishes authorized changes and owns PR monitoring. Keep the batch in this conversation with child-agent results; ordinary top-level T3 threads are not subagents.
 
-For any authorized browser work in T3 Code, load and follow [T3 Code Navigator](../joulemv-browser-testing/SKILL.md#t3-code-navigator): use the built-in `preview_*` browser exclusively, reuse owned tabs, and report unavailable browser evidence as **Blocked** without launching external Chrome or another browser. Include that requirement and the shared skill path in every browser-capable delegated or launched-thread brief. This does not expand this skill's execution or publication scope.
+For any authorized browser work in T3 Code, load and follow [T3 Code Navigator](../../testing-and-quality/browser-testing/SKILL.md#t3-code-navigator): use the built-in `preview_*` browser exclusively, reuse owned tabs, and report unavailable browser evidence as **Blocked** without launching external Chrome or another browser. Include that requirement and the shared skill path in every browser-capable delegated or launched-thread brief. This does not expand this skill's execution or publication scope.
 
 ## Find the queue
 
@@ -38,11 +38,11 @@ Bot feedback alone does not qualify. Later bot comments do not clear an unanswer
 
 The collector checks published GitHub activity; local uncommitted work and normal pushes of old, unchanged commits may not be timestamped by GitHub. Do not claim it proves the absence of such work. PR `updatedAt` alone cannot identify author activity because bots and CI also update it.
 
-Show the matching PR links once, newest feedback first. Preserve unavailable PRs as coverage gaps. If no matches remain, report that and stop.
+Show the matching PRs in a compact table, newest feedback first, with **PR / other labels**, **Risk**, **Priority**, and **Latest feedback** columns. Use the collector's labels and follow respond's **Show PR labels in the plan** rules. Preserve unavailable PRs as coverage gaps. If no matches remain, report that and stop.
 
 ## Delegate the queue
 
-Freeze the initial queue. Keep a compact ledger with repository, PR URL, triggering feedback URL/date, original human reviewer identities and thread/comment IDs, initial/current head SHA, permissions already granted, child phase/task/worktree, watcher and status. Re-fetch each candidate with `--pr` immediately before dispatching its analysis; skip it if now approved, closed, answered, or updated. Missing code access blocks only that PR; continue the others and retain the gap.
+Freeze the initial queue. Keep a compact ledger with repository, PR URL, exact labels and collection time, triggering feedback URL/date, original human reviewer identities and thread/comment IDs, initial/current head SHA, permissions already granted, child phase/task/worktree, watcher and status. Re-fetch each candidate with `--pr` immediately before dispatching its analysis; skip it if now approved, closed, answered, or updated. Missing code access blocks only that PR; continue the others and retain the gap.
 
 ### Choose the child mechanism
 
@@ -56,7 +56,17 @@ If no supported child mechanism is available, report the limitation and preserve
 
 Give one read-only analyzer per PR its repository/URL, pinned head/base, triggering feedback, repository and respond instructions, and existing authorization. Every GitHub query must name the target repository or endpoint explicitly; the child's current branch must not determine the PR.
 
-Require respond's full analyzer report: all relevant feedback, per-comment dispositions and evidence, fix/verification plan, exact-thread reply drafts, original human reviewer identities, observed head/base and blockers. Human feedback selects the PR; bot feedback within it still receives the disposition required by respond. The parent links the PR to this T3 thread when available and records the report. That PR's analysis phase remains read-only while independent authorized PR work can advance.
+Require respond's full analyzer report: all relevant feedback, current labels, per-comment dispositions and evidence, fix/verification plan, exact-thread reply drafts, original human reviewer identities, observed head/base and blockers. Human feedback selects the PR; bot feedback within it still receives the disposition required by respond. The parent links the PR to this T3 thread when available and records the report. That PR's analysis phase remains read-only while independent authorized PR work can advance.
+
+### Present the combined analysis plan
+
+Before any combined authorization request, refresh labels and show one summary row per analyzed PR:
+
+| PR / other labels | Risk | Priority | Feedback and suggested plan | Verification / blockers |
+| --- | --- | --- | --- | --- |
+| [#number — title](PR URL); remaining labels or None | Current risk label or Not labeled | Current priority label or Not labeled | Main feedback; proposed Fix / Answer / Defer / No change actions | Focused checks, dependencies, and missing evidence |
+
+Apply respond's **Show PR labels in the plan** rules even when a repository-local respond command is selected. Follow the summary with the full per-comment tables, retaining the PR, risk, and priority columns so the context stays visible beside each proposed solution. Keep those columns in final per-PR outcome tables too. Labels are observed metadata; a critical risk label does not by itself establish a defect or high merge priority.
 
 ### Per-PR fix phase
 

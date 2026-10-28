@@ -27,6 +27,7 @@ EVENT = "__typename " + " ".join(
     )
 )
 CONNECTIONS = {
+    "labels": ("name", True, ""),
     "comments": (COMMENT, False, ""),
     "reviews": (REVIEW, False, ""),
     "reviewThreads": (THREAD, True, ""),
@@ -211,6 +212,7 @@ def evaluate(pr, detail, login):
         "repository": pr["repository"]["nameWithOwner"], "number": pr["number"],
         "title": pr["title"], "url": pr["url"], "headSha": pr["headRefOid"],
         "reviewDecision": pr.get("reviewDecision"), "feedback": latest,
+        "labels": [label["name"] for label in detail["labels"]],
     }, None
 
 
