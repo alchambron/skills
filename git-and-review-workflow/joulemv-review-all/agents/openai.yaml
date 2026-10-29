@@ -1,4 +1,4 @@
 interface:
   display_name: "Review all my PRs"
-  short_description: "Review, publish findings, and live-test in one thread"
-  default_prompt: "Use $joulemv-review-all to review all PRs requesting my review in this thread, publish verified inline findings, and live-test the remaining PRs with guides and screenshots."
+  short_description: "Review and live-test JouleMV and WebSynco PRs by project"
+  default_prompt: "Use $joulemv-review-all to review all PRs requesting my review in this thread, group JouleMV and WebSynco results by project and repository, publish verified inline findings, and live-test the remaining PRs using their own conventions and isolated runtimes."

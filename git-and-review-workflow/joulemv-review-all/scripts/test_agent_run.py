@@ -9,7 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from urllib.error import HTTPError
 
 
@@ -57,6 +57,191 @@ class RuntimeTests(unittest.TestCase):
         self.state = {"owner": "joulemv-agent-run", "repo": str(self.root),
                       "dbName": "jmv_ai_" + "a" * 14, "dbCreated": False}
 
+    def test_toolchain_discovery_timeouts_allow_configured_java(self):
+        (self.root / "pom.xml").write_text("<java.version>21</java.version>")
+        home = self.root / "jdk"
+        (home / "bin").mkdir(parents=True)
+        (home / "bin/java").touch()
+
+        def probe(args, **kwargs):
+            self.assertGreater(kwargs.get("timeout", 0), 0)
+            if args[0] in ("brew", "/usr/libexec/java_home"):
+                raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+            return subprocess.CompletedProcess(args, 0, "", 'openjdk version "21.0.1"')
+
+        with patch.dict(agent_run.os.environ, {"JAVA_HOME": str(home)}, clear=True), \
+                patch.object(agent_run.shutil, "which", side_effect=lambda name: "brew" if name == "brew" else None), \
+                patch.object(agent_run.Path, "is_file", return_value=True), \
+                patch.object(agent_run.subprocess, "run", side_effect=probe) as run:
+            self.assertEqual(agent_run.java_env()["JAVA_HOME"], str(home))
+        self.assertEqual([call.args[0][0] for call in run.call_args_list],
+                         ["brew", "/usr/libexec/java_home", str(home / "bin/java")])
+
+    def test_websynco_frontend_is_rejected_before_environment_or_database_access(self):
+        (self.root / "AGENT.md").write_text("WebSynco React guidance")
+        (self.root / "package.json").write_text('{"name":"reactfront"}')
+        (self.root / "package-lock.json").write_text('{}')
+        with patch.object(agent_run, "load_env") as load_env, \
+                patch.object(agent_run, "source_database") as source_database, \
+                patch.object(agent_run, "run") as run:
+            with self.assertRaisesRegex(agent_run.LaunchError, "JouleMV worktree root"):
+                agent_run.preflight()
+        load_env.assert_not_called()
+        source_database.assert_not_called()
+        run.assert_not_called()
+
+    def test_timed_out_java_version_skips_to_working_candidate(self):
+        (self.root / "pom.xml").write_text("<java.version>21</java.version>")
+        stalled_home, working_home = self.root / "stalled", self.root / "working"
+
+        def probe(args, **kwargs):
+            if args[0] == "/usr/libexec/java_home":
+                return subprocess.CompletedProcess(args, 0, str(working_home), "")
+            if args[0] == str(stalled_home / "bin/java"):
+                raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+            return subprocess.CompletedProcess(args, 0, "", 'openjdk version "21.0.1"')
+
+        with patch.dict(agent_run.os.environ, {"JAVA_HOME": str(stalled_home)}, clear=True), \
+                patch.object(agent_run.shutil, "which", return_value=None), \
+                patch.object(agent_run.Path, "is_file", return_value=True), \
+                patch.object(agent_run.subprocess, "run", side_effect=probe):
+            self.assertEqual(agent_run.java_env()["JAVA_HOME"], str(working_home))
+
+    def test_all_java_version_timeouts_report_missing_toolchain(self):
+        (self.root / "pom.xml").write_text("<java.version>21</java.version>")
+        with patch.dict(agent_run.os.environ, {"JAVA_HOME": str(self.root / "stalled")}, clear=True), \
+                patch.object(agent_run.shutil, "which", return_value=None), \
+                patch.object(agent_run.Path, "is_file", return_value=True), \
+                patch.object(agent_run.subprocess, "run", side_effect=subprocess.TimeoutExpired("java", 5)):
+            with self.assertRaisesRegex(agent_run.LaunchError, "Java 21 is required"):
+                agent_run.java_env()
+
+    def test_process_stamp_timeout_returns_unavailable_identity(self):
+        def probe(args, **kwargs):
+            self.assertGreater(kwargs.get("timeout", 0), 0)
+            raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+
+        with patch.object(agent_run.subprocess, "run", side_effect=probe):
+            self.assertEqual(agent_run.process_stamp(42), "")
+
+    def test_cleanup_never_signals_group_with_unavailable_or_reused_identity(self):
+        for saved, current in (("original", "different"), ("", "now"), (None, "now")):
+            with self.subTest(saved=saved, current=current), \
+                    patch.object(agent_run, "process_group", return_value={"42": current}), \
+                    patch.object(agent_run.os, "killpg") as killpg:
+                with self.assertRaisesRegex(agent_run.LaunchError, "identity"):
+                    agent_run.stop_process(42, saved)
+                killpg.assert_not_called()
+
+    def test_cleanup_probe_failure_after_term_does_not_force_kill(self):
+        with patch.object(agent_run, "process_group", side_effect=[
+                {"42": "original"}, agent_run.LaunchError("Cannot verify process group identity")]), \
+                patch.object(agent_run.os, "killpg") as killpg:
+            with self.assertRaisesRegex(agent_run.LaunchError, "identity"):
+                agent_run.stop_process(42, "original")
+        killpg.assert_called_once_with(42, agent_run.signal.SIGTERM)
+
+    def test_stop_preserves_state_when_process_identity_is_unavailable(self):
+        state = {**self.state, "runId": "a" * 32, "backendPid": 42, "backendStamp": "original"}
+        agent_run.write_state(state)
+        with patch.object(agent_run, "process_group", return_value={"43": "unrecorded child"}), \
+                patch.object(agent_run.os, "killpg") as signal, \
+                patch.object(agent_run, "drop_agent_db") as drop:
+            with self.assertRaisesRegex(agent_run.LaunchError, "identity"):
+                agent_run.stop()
+        signal.assert_not_called()
+        drop.assert_not_called()
+        self.assertEqual(agent_run.read_state(), state)
+
+    def test_dead_leader_with_recorded_child_is_cleaned(self):
+        with patch.object(agent_run, "process_group", side_effect=[{"43": "child"}, {}]), \
+                patch.object(agent_run.os, "killpg") as killpg:
+            agent_run.stop_process(42, "leader", {"42": "leader", "43": "child"})
+        killpg.assert_called_once_with(42, agent_run.signal.SIGTERM)
+
+    def test_surviving_child_is_force_killed_after_leader_exits(self):
+        snapshots = [{"42": "leader", "43": "child"}] + [{"43": "child"}] * 51 + [{}]
+        with patch.object(agent_run, "process_group", side_effect=snapshots), \
+                patch.object(agent_run.time, "sleep"), \
+                patch.object(agent_run.os, "killpg") as killpg:
+            agent_run.stop_process(42, "leader")
+        self.assertEqual([call.args for call in killpg.call_args_list],
+                         [(42, agent_run.signal.SIGTERM), (42, agent_run.signal.SIGKILL)])
+
+    def test_surviving_group_prevents_successful_cleanup_receipt(self):
+        with patch.object(agent_run, "process_group", return_value={"42": "leader"}), \
+                patch.object(agent_run.time, "sleep"), \
+                patch.object(agent_run.os, "killpg"):
+            with self.assertRaisesRegex(agent_run.LaunchError, "did not exit"):
+                agent_run.stop_process(42, "leader")
+
+    def test_real_orphan_child_is_stopped_using_saved_group_identity(self):
+        # Bounded idle Python processes, not application servers or database fixtures.
+        program = ("import subprocess,sys,time; "
+                   "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)'],stdout=subprocess.DEVNULL); "
+                   "print(child.pid,flush=True); time.sleep(30)")
+        process = subprocess.Popen([sys.executable, "-c", program], start_new_session=True,
+                                   stdout=subprocess.PIPE, text=True)
+        members = {}
+        try:
+            child_pid = process.stdout.readline().strip()
+            self.assertTrue(child_pid.isdigit())
+            members = agent_run.process_group(process.pid)
+            self.assertIn(child_pid, members)
+            stamp = agent_run.process_stamp(process.pid)
+            process.terminate()
+            process.wait(timeout=5)
+            self.assertIn(child_pid, agent_run.process_group(process.pid))
+            agent_run.stop_process(process.pid, stamp, members)
+            self.assertEqual(agent_run.process_group(process.pid), {})
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+            process.stdout.close()
+            if members:
+                agent_run.stop_process(process.pid, members=members)
+
+    def test_process_group_ignores_zombies_and_normalizes_stamps(self):
+        result = subprocess.CompletedProcess([], 0,
+            " 42 42 S Thu Oct  1 12:00:00 2026\n 43 42 Z Thu Oct  1 12:00:00 2026\n 44 44 S Thu Oct  1 12:00:00 2026\n", "")
+        with patch.object(agent_run.subprocess, "run", return_value=result):
+            self.assertEqual(agent_run.process_group(42), {"42": "Thu Oct 1 12:00:00 2026"})
+
+    def test_start_missing_identity_persists_pid_and_continues_cleanup(self):
+        def unavailable_stamp(pid):
+            persisted = agent_run.read_state()
+            self.assertEqual(persisted["backendPid"], pid)
+            self.assertEqual(persisted["phase"], "starting")
+            return ""
+
+        with patch.object(agent_run, "lock_state", return_value=contextlib.nullcontext()), \
+                patch.object(agent_run, "run", return_value="head"), \
+                patch.object(agent_run, "preflight", return_value=(
+                    self.values, self.source, self.tools, {"JAVA_HOME": "/test/jdk"}, 1)), \
+                patch.object(agent_run, "prepare_frontend", return_value=1), \
+                patch.object(agent_run, "build_backend", return_value=self.root / "app.war"), \
+                patch.object(agent_run, "choose_port", return_value=8100), \
+                patch.object(agent_run, "create_agent_db"), \
+                patch.object(agent_run.subprocess, "Popen", return_value=Mock(pid=42)) as popen, \
+                patch.object(agent_run, "process_stamp", side_effect=unavailable_stamp), \
+                patch.object(agent_run, "process_group", return_value={"42": "unverified"}), \
+                patch.object(agent_run.os, "killpg") as killpg, \
+                patch.object(agent_run, "drop_agent_db") as drop, \
+                patch.object(agent_run, "cleanup_vite") as cleanup, \
+                patch.object(agent_run, "output") as output:
+            with self.assertRaisesRegex(agent_run.LaunchError, "state retained for retry"):
+                agent_run.start(10, 1)
+        popen.assert_called_once()
+        killpg.assert_not_called()
+        drop.assert_called_once()
+        cleanup.assert_called_once()
+        output.assert_not_called()
+        state = agent_run.read_state()
+        self.assertEqual(state["backendPid"], 42)
+        self.assertEqual(state["backendStamp"], "")
+        self.assertNotEqual(state["phase"], "ready")
+
     def test_current_schema_restores_clone_without_tenant_queries_or_sql(self):
         with patch.object(agent_run, "database_exists", return_value=False), \
                 patch.object(agent_run, "run", return_value="") as run:
@@ -65,6 +250,9 @@ class RuntimeTests(unittest.TestCase):
                          ["createdb", "pg_dump", "pg_restore"])
         self.assertEqual(count, 0)
         persisted = agent_run.read_state()
+        self.assertEqual(persisted["dbEndpoint"], {"host": "127.0.0.1", "port": 5432, "user": "localuser", "sourceName": "devdb"})
+        self.assertNotIn("DB_PASS", str(persisted))
+        self.assertNotIn(self.values["DB_PASS"], str(persisted))
         self.assertTrue(persisted["cloneRestored"])
         self.assertEqual(persisted["schemaMode"], "current")
         self.assertEqual(persisted["tenantSchemasProcessed"], 0)
@@ -219,13 +407,52 @@ class RuntimeTests(unittest.TestCase):
             run.assert_not_called()
 
     def test_database_cleanup_checks_name_and_repository_ownership(self):
-        for state in ({**self.state, "dbName": "devdb", "dbCreated": True},
-                      {**self.state, "repo": "/other", "dbCreated": True},
-                      {**self.state, "dbName": "unowned", "dbCreated": True}):
+        endpoint = {"host": "127.0.0.1", "port": 5432, "user": "localuser", "sourceName": "devdb"}
+        owned = {**self.state, "dbCreated": True, "dbEndpoint": endpoint}
+        for state in ({**owned, "dbName": "devdb"},
+                      {**owned, "repo": "/other"},
+                      {**owned, "dbName": "unowned"},
+                      {**owned, "dbEndpoint": {**endpoint, "sourceName": owned["dbName"]}}):
             with self.subTest(state=state), patch.object(agent_run, "run") as run:
-                with self.assertRaises(agent_run.LaunchError):
-                    agent_run.drop_agent_db(state, self.values, self.source, self.tools)
+                with self.assertRaisesRegex(agent_run.LaunchError, "not owned"):
+                    agent_run.drop_agent_db(state, self.values, self.tools)
                 run.assert_not_called()
+
+    def test_database_cleanup_uses_pinned_endpoint_after_configuration_drift(self):
+        state = {**self.state, "dbCreated": True,
+                 "dbEndpoint": {"host": "127.0.0.1", "port": 5432, "user": "localuser", "sourceName": "devdb"}}
+        changed = {**self.values, "DB_URL": "jdbc:postgresql://127.0.0.1:5433/other",
+                   "DB_AUTH_URL": "jdbc:postgresql://127.0.0.1:5433/other"}
+        with patch.object(agent_run, "run") as run, \
+                patch.object(agent_run, "database_exists", return_value=False) as exists:
+            agent_run.drop_agent_db(state, changed, self.tools)
+        args = run.call_args.args[0]
+        self.assertEqual(args[args.index("-p") + 1], "5432")
+        self.assertEqual(args[args.index("-U") + 1], "localuser")
+        self.assertEqual(exists.call_args.args[2:], ("127.0.0.1", 5432, "localuser", state["dbName"]))
+
+    def test_database_cleanup_retains_legacy_receipt_without_endpoint(self):
+        state = {**self.state, "dbCreated": True, "runId": "a" * 32}
+        agent_run.write_state(state)
+        with patch.object(agent_run, "load_env", return_value=self.values), \
+                patch.object(agent_run, "pg_tools", return_value=self.tools), \
+                patch.object(agent_run, "run") as run:
+            with self.assertRaisesRegex(agent_run.LaunchError, "legacy receipt"):
+                agent_run.stop()
+        run.assert_not_called()
+        self.assertEqual(agent_run.read_state(), state)
+
+    def test_database_cleanup_verifies_absence_and_retains_failed_receipt(self):
+        state = {**self.state, "dbCreated": True, "runId": "a" * 32,
+                 "dbEndpoint": {"host": "localhost", "port": 5432, "user": "localuser", "sourceName": "devdb"}}
+        agent_run.write_state(state)
+        with patch.object(agent_run, "load_env", return_value=self.values), \
+                patch.object(agent_run, "pg_tools", return_value=self.tools), \
+                patch.object(agent_run, "run"), \
+                patch.object(agent_run, "database_exists", return_value=True):
+            with self.assertRaisesRegex(agent_run.LaunchError, "still exists"):
+                agent_run.stop()
+        self.assertEqual(agent_run.read_state(), state)
 
     def test_stop_is_idempotent_and_watchdog_cannot_stop_new_run(self):
         with patch.object(agent_run, "lock_state", return_value=contextlib.nullcontext()), \
@@ -240,14 +467,6 @@ class RuntimeTests(unittest.TestCase):
                 patch.object(agent_run, "stop_process") as stop:
             agent_run.stop(expected_run_id="old")
             stop.assert_not_called()
-
-    def test_process_stamp_mismatch_is_not_killed(self):
-        with patch.object(agent_run.os, "kill") as kill, \
-                patch.object(agent_run.os, "killpg") as killpg, \
-                patch.object(agent_run, "process_stamp", return_value="different"):
-            agent_run.stop_process(42, "original")
-        kill.assert_called_once_with(42, 0)
-        killpg.assert_not_called()
 
     def test_watchdog_expiry_stops_only_its_owned_run(self):
         state = {"runId": "owned", "expiresAt": 0}
@@ -269,7 +488,7 @@ class RuntimeTests(unittest.TestCase):
                 contextlib.redirect_stdout(io.StringIO()):
             agent_run.stop()
         self.assertEqual(stop.call_count, 2)
-        drop.assert_called_once_with(state, self.values, self.source, self.tools)
+        drop.assert_called_once_with(state, self.values, self.tools)
         cleanup.assert_called_once_with(state["runId"])
         self.assertFalse(agent_run.STATE_FILE.exists())
 

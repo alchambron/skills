@@ -124,13 +124,21 @@ def java_env():
     result = os.environ.copy()
     candidates = [result["JAVA_HOME"]] if result.get("JAVA_HOME") else []
     if shutil.which("brew"):
-        prefix = subprocess.run(["brew", "--prefix", "openjdk@" + version_number], capture_output=True, text=True)
-        if prefix.returncode == 0:
-            candidates.append(str(Path(prefix.stdout.strip()) / "libexec/openjdk.jdk/Contents/Home"))
+        try:
+            prefix = subprocess.run(["brew", "--prefix", "openjdk@" + version_number],
+                                    capture_output=True, text=True, timeout=5)
+            if prefix.returncode == 0:
+                candidates.append(str(Path(prefix.stdout.strip()) / "libexec/openjdk.jdk/Contents/Home"))
+        except (OSError, subprocess.TimeoutExpired):
+            pass
     if Path("/usr/libexec/java_home").is_file():
-        selected = subprocess.run(["/usr/libexec/java_home", "-v", version_number], capture_output=True, text=True)
-        if selected.returncode == 0:
-            candidates.append(selected.stdout.strip())
+        try:
+            selected = subprocess.run(["/usr/libexec/java_home", "-v", version_number],
+                                      capture_output=True, text=True, timeout=5)
+            if selected.returncode == 0:
+                candidates.append(selected.stdout.strip())
+        except (OSError, subprocess.TimeoutExpired):
+            pass
     installed_java = shutil.which("java")
     if installed_java:
         inferred_home = Path(installed_java).resolve().parent.parent
@@ -139,7 +147,10 @@ def java_env():
     for home in candidates:
         java = Path(home) / "bin/java"
         if java.is_file():
-            version = subprocess.run([str(java), "-version"], capture_output=True, text=True, timeout=5)
+            try:
+                version = subprocess.run([str(java), "-version"], capture_output=True, text=True, timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
+                continue
             if re.search(r'version "' + re.escape(version_number) + r'(?:\.|\")', version.stderr):
                 result["JAVA_HOME"] = home
                 result["PATH"] = str(Path(home) / "bin") + os.pathsep + result.get("PATH", "")
@@ -213,15 +224,25 @@ def database_exists(tools, db_env, host, port, user, name):
     return raw == "1"
 
 
-def drop_agent_db(state, values, source, tools):
+def drop_agent_db(state, values, tools):
     if not state.get("dbCreated"):
         return
+    endpoint = state.get("dbEndpoint")
+    if not isinstance(endpoint, dict) or not all(endpoint.get(key) for key in ("host", "port", "user", "sourceName")):
+        raise LaunchError("Database endpoint missing from legacy receipt; verify the original local cluster before recovering cleanup; state retained")
+    host, port, user = endpoint["host"], endpoint["port"], endpoint["user"]
     name = state.get("dbName", "")
-    if not DB_PATTERN.fullmatch(name) or state.get("repo") != str(ROOT) or name == source[2]:
+    if (not DB_PATTERN.fullmatch(name) or state.get("repo") != str(ROOT)
+            or name == endpoint["sourceName"] or host not in LOOPBACK
+            or not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535):
         raise LaunchError("Refusing to drop a database not owned by this worktree")
+    if values.get("DB_USER") != user or not values.get("DB_PASS"):
+        raise LaunchError("Cleanup requires credentials for the recorded database user; state retained")
     db_env = {**os.environ, "PGPASSWORD": values["DB_PASS"]}
-    run([tools["dropdb"], "--if-exists", "--force", "-h", source[0], "-p", str(source[1]),
-         "-U", values["DB_USER"], name], env=db_env, log=STATE_DIR / "database.log", timeout=60)
+    run([tools["dropdb"], "--if-exists", "--force", "-h", host, "-p", str(port),
+         "-U", user, name], env=db_env, log=STATE_DIR / "database.log", timeout=60)
+    if database_exists(tools, db_env, host, port, user, name):
+        raise LaunchError("Owned database still exists after cleanup; state retained")
 
 
 def create_agent_db(state, values, source, tools, schema_mode="migrate"):
@@ -234,6 +255,7 @@ def create_agent_db(state, values, source, tools, schema_mode="migrate"):
         raise LaunchError("Refusing to reuse an existing database without a ready agent state")
     run([tools["createdb"], "-h", host, "-p", str(port), "-U", values["DB_USER"], name],
         env=db_env, log=STATE_DIR / "database.log", timeout=60)
+    state["dbEndpoint"] = {"host": host, "port": port, "user": values["DB_USER"], "sourceName": source_name}
     state["dbCreated"] = True
     write_state(state)
     archive = STATE_DIR / "seed.dump"
@@ -399,14 +421,18 @@ def cleanup_vite(run_id):
 
 
 def process_stamp(pid):
-    result = subprocess.run(["ps", "-p", str(pid), "-o", "lstart="], capture_output=True, text=True)
+    try:
+        result = subprocess.run(["ps", "-p", str(pid), "-o", "lstart="],
+                                capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
     return result.stdout.strip() if result.returncode == 0 else ""
 
 
 def alive(pid, stamp=None):
     try:
         os.kill(pid, 0)
-        return not stamp or process_stamp(pid) == stamp
+        return stamp is None or (bool(stamp) and process_stamp(pid) == stamp)
     except (OSError, TypeError):
         return False
 
@@ -427,31 +453,63 @@ def write_state(data):
     temp.replace(STATE_FILE)
 
 
-def stop_process(pid, stamp=None):
-    if not pid or not alive(pid, stamp):
-        return
+def process_group(pgid):
+    """Return live group members and start stamps without exposing command arguments."""
     try:
-        os.killpg(pid, signal.SIGTERM)
-    except ProcessLookupError:
+        result = subprocess.run(["ps", "-axo", "pid=,pgid=,stat=,lstart="],
+                                capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise LaunchError("Cannot verify process group identity; state retained") from exc
+    if result.returncode:
+        raise LaunchError("Cannot inspect process group; state retained")
+    members = {}
+    for line in result.stdout.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) != 4 or not parts[0].isdigit() or not parts[1].isdigit():
+            raise LaunchError("Malformed process identity response; state retained")
+        if int(parts[1]) == pgid and not parts[2].startswith("Z"):
+            members[str(int(parts[0]))] = " ".join(parts[3].split())
+    return members
+
+
+def stop_process(pid, stamp=None, members=None):
+    if not pid:
         return
-    except PermissionError:
+    known = dict(members or {})
+    if stamp:
+        known[str(pid)] = " ".join(stamp.split())
+
+    def inspect():
+        current = process_group(pid)
+        if current and not any(known.get(member) == started for member, started in current.items()):
+            raise LaunchError("Cannot verify process group identity for PID %s; refusing to signal it; state retained" % pid)
+        # A surviving known member proves group continuity, including children born since capture.
+        known.update(current)
+        return current
+
+    def signal_group(value):
         try:
-            os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            return
-    for _ in range(50):
-        if not alive(pid, stamp):
-            return
-        time.sleep(0.1)
-    try:
-        os.killpg(pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    except PermissionError:
-        try:
-            os.kill(pid, signal.SIGKILL)
+            os.killpg(pid, value)
         except ProcessLookupError:
             pass
+        except PermissionError as exc:
+            raise LaunchError("Cannot signal the complete owned process group; state retained") from exc
+
+    if not inspect():
+        return
+    signal_group(signal.SIGTERM)
+    for _ in range(50):
+        if not inspect():
+            return
+        time.sleep(0.1)
+    # Recheck identity immediately before escalation, including surviving descendants.
+    if inspect():
+        signal_group(signal.SIGKILL)
+    for _ in range(50):
+        if not inspect():
+            return
+        time.sleep(0.1)
+    raise LaunchError("Owned process group did not exit; state retained")
 
 
 def lock_state():
@@ -534,9 +592,12 @@ def start(timeout, max_runtime_minutes, schema_mode="migrate"):
                                            cwd=ROOT, env=app_env, stdout=be_log, stderr=subprocess.STDOUT,
                                            start_new_session=True)
             state["backendPid"] = backend.pid
-            state["backendStamp"] = process_stamp(backend.pid)
             state["phase"] = "starting"
             write_state(state)
+            state["backendStamp"] = process_stamp(backend.pid)
+            write_state(state)
+            if not state["backendStamp"]:
+                raise LaunchError("Cannot verify backend process identity; runtime was not marked ready")
             with open(STATE_DIR / "frontend.log", "a", encoding="utf-8") as fe_log:
                 frontend = subprocess.Popen(["npm", "--prefix", "frontend", "run", "dev", "--",
                                              "--config", str(vite_config), "--host", "127.0.0.1",
@@ -544,8 +605,11 @@ def start(timeout, max_runtime_minutes, schema_mode="migrate"):
                                             cwd=ROOT, env=frontend_env, stdout=fe_log,
                                             stderr=subprocess.STDOUT, start_new_session=True)
             state["frontendPid"] = frontend.pid
+            write_state(state)
             state["frontendStamp"] = process_stamp(frontend.pid)
             write_state(state)
+            if not state["frontendStamp"]:
+                raise LaunchError("Cannot verify frontend process identity; runtime was not marked ready")
             deadline = time.monotonic() + timeout
             while time.monotonic() < deadline:
                 if backend.poll() is not None or frontend.poll() is not None:
@@ -553,6 +617,11 @@ def start(timeout, max_runtime_minutes, schema_mode="migrate"):
                 if backend_login_ready(backend_url) and frontend_ready(frontend_url):
                     if run(["git", "rev-parse", "HEAD"]) != commit:
                         raise LaunchError("Worktree HEAD changed during startup; runtime was not marked ready")
+                    for role, process in (("backend", backend), ("frontend", frontend)):
+                        members = process_group(process.pid)
+                        if members.get(str(process.pid)) != " ".join(state[role + "Stamp"].split()):
+                            raise LaunchError("Server identity changed during startup; state retained")
+                        state[role + "Members"] = members
                     state["phase"] = "ready"
                     state["expiresAt"] = time.time() + max_runtime_minutes * 60
                     write_state(state)
@@ -574,11 +643,11 @@ def start(timeout, max_runtime_minutes, schema_mode="migrate"):
             cleanup_errors = []
             for role in ("backend", "frontend"):
                 try:
-                    stop_process(state.get(role + "Pid"), state.get(role + "Stamp"))
-                except OSError as exc:
+                    stop_process(state.get(role + "Pid"), state.get(role + "Stamp"), state.get(role + "Members"))
+                except (LaunchError, OSError) as exc:
                     cleanup_errors.append("%s process: %s" % (role, exc))
             try:
-                drop_agent_db(state, values, source, tools)
+                drop_agent_db(state, values, tools)
             except Exception as cleanup_error:
                 cleanup_errors.append("database: %s" % cleanup_error)
             try:
@@ -625,15 +694,14 @@ def stop(expected_run_id=None):
             return
         if expected_run_id and state.get("runId") != expected_run_id:
             return
-        stop_process(state.get("backendPid"), state.get("backendStamp"))
-        stop_process(state.get("frontendPid"), state.get("frontendStamp"))
+        stop_process(state.get("backendPid"), state.get("backendStamp"), state.get("backendMembers"))
+        stop_process(state.get("frontendPid"), state.get("frontendStamp"), state.get("frontendMembers"))
         values = load_env()
-        source = source_database(values)
         tools = pg_tools()
-        drop_agent_db(state, values, source, tools)
+        drop_agent_db(state, values, tools)
         cleanup_vite(state["runId"])
         STATE_FILE.unlink(missing_ok=True)
-        output(ok=True, status="stopped", databaseDropped=True)
+        output(ok=True, status="stopped", databaseDropped=True, serversStopped=True)
 
 
 def watchdog(run_id):

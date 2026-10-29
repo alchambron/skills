@@ -65,8 +65,8 @@ class FakeGitHub:
         parts = endpoint.split("/")
         return metadata("/".join(parts[1:3]), int(parts[-1]))
 
-    def graphql(self, query):
-        self.calls.append(("graphql", query))
+    def graphql(self, query, variables=None):
+        self.calls.append(("graphql", {"query": query, "variables": variables or {}}))
         if self.graphql_responses:
             response = self.graphql_responses.pop(0)
             if isinstance(response, Exception):
@@ -108,6 +108,22 @@ class CollectionTests(unittest.TestCase):
         self.assertEqual(len(snapshot["excluded"]), 2)
         self.assertTrue(snapshot["collection"]["complete"])
         self.assertFalse(any(endpoint.endswith("/files") for endpoint, _ in api.calls))
+
+    def test_mixed_projects_keep_repository_identity_and_profile_metadata(self):
+        repositories = ["EnerZam/JouleMV", "EnerZam/WebSynco_React_Front",
+                        "EnerZam/WebSynco", "AnotherOwner/JouleMV"]
+        snapshot = self.run_collection(FakeGitHub([hit(repository, 10) for repository in repositories]))
+        self.assertTrue(snapshot["collection"]["complete"])
+        self.assertEqual([pr["repository"] for pr in snapshot["prs"]], repositories)
+        self.assertEqual([pr["project_type"] for pr in snapshot["prs"]],
+                         ["joulemv", "websynco-react-front", "websynco-backend", "other"])
+        self.assertEqual(snapshot["prs"][1]["project_label"], "WebSynco React frontend")
+        self.assertEqual(len({pr["artifact_dir"] for pr in snapshot["prs"]}), 4)
+        self.assertTrue(all(pr["head_sha"] == "b" * 40 for pr in snapshot["prs"]))
+
+    def test_project_identity_matching_is_case_insensitive(self):
+        snapshot = self.run_collection(FakeGitHub([hit("enerzam/websynco_REACT_front")]))
+        self.assertEqual(snapshot["prs"][0]["project_type"], "websynco-react-front")
 
     def test_requested_reviewer_on_second_page_is_retained(self):
         api = FakeGitHub()
@@ -161,6 +177,36 @@ class CollectionTests(unittest.TestCase):
         snapshot = self.run_collection(api)
         self.assertEqual(len(snapshot["prs"]), 2)
         self.assertEqual([params["page"] for endpoint, params in api.calls if endpoint == "search/issues"], [1, 2])
+
+    def test_graphql_values_containing_placeholder_tokens_remain_exact(self):
+        api = FakeGitHub()
+        owner, repository = "REPO-NUMBER-AFTER", "NUMBER-AFTER-OWNER"
+        thread_id, comment_cursor = 'THREAD-CURSOR"\\id', 'CURSOR-AFTER"\\comments'
+        thread_cursor = 'AFTER-REPO"\\threads'
+        thread = {"id": thread_id, "comments": {"totalCount": 1, "nodes": [],
+                  "pageInfo": {"hasNextPage": True, "endCursor": comment_cursor}}}
+        api.graphql_responses = [
+            {"repository": {"pullRequest": {"reviewThreads": {"nodes": [thread],
+                "pageInfo": {"hasNextPage": True, "endCursor": thread_cursor}}}}},
+            {"node": {"comments": {"nodes": [{"id": "comment", "databaseId": 1}],
+                "pageInfo": {"hasNextPage": False, "endCursor": None}}}},
+            {"repository": {"pullRequest": {"reviewThreads": {"nodes": [],
+                "pageInfo": {"hasNextPage": False, "endCursor": None}}}}},
+        ]
+        threads, complete, error = collector.collect_threads(api, owner, repository, 42,
+                                                             self.output / "review-threads.json")
+        self.assertTrue(complete, error)
+        self.assertEqual(threads[0]["comments"]["nodes"][0]["databaseId"], 1)
+        calls = [payload for endpoint, payload in api.calls if endpoint == "graphql"]
+        self.assertEqual(calls[0]["variables"], {"owner": owner, "name": repository, "number": 42, "after": None})
+        self.assertEqual(calls[1]["variables"], {"thread": thread_id, "after": comment_cursor})
+        self.assertEqual(calls[2]["variables"], {"owner": owner, "name": repository, "number": 42, "after": thread_cursor})
+        self.assertEqual(calls[0]["query"], calls[2]["query"])
+        for payload in calls:
+            for value in [owner, repository, thread_id, comment_cursor, thread_cursor]:
+                self.assertNotIn(value, payload["query"])
+        self.assertIn("$number: Int!", calls[0]["query"])
+        self.assertIn("$thread: ID!", calls[1]["query"])
 
     def test_search_caps_and_incomplete_results_never_claim_complete(self):
         api = FakeGitHub()
@@ -227,7 +273,13 @@ class TransportTests(unittest.TestCase):
         def runner(argv, **kwargs):
             calls.append((argv, kwargs))
             if "graphql" in argv:
-                response = {"data": backend.graphql(argv[-1].removeprefix("query="))}
+                fields = {}
+                for index, argument in enumerate(argv):
+                    if argument in {"-f", "-F"}:
+                        key, value = argv[index + 1].split("=", 1)
+                        fields[key] = int(value) if argument == "-F" else value
+                query = fields.pop("query")
+                response = {"data": backend.graphql(query, fields)}
             else:
                 parsed = urlparse(argv[-1])
                 parameters = {key: values[0] for key, values in parse_qs(parsed.query).items()}
@@ -246,9 +298,30 @@ class TransportTests(unittest.TestCase):
             self.assertIsInstance(argv, list)
             self.assertNotIn("shell", kwargs)
             if "graphql" in argv:
-                self.assertTrue(argv[-1].startswith("query=query"))
+                self.assertTrue(any(argument.startswith("query=query") for argument in argv))
+                self.assertIn("number=10", argv)
             else:
                 self.assertEqual(argv[argv.index("--method") + 1], "GET")
+
+    def test_graphql_transport_keeps_strings_raw_and_numbers_typed(self):
+        calls = []
+
+        def runner(argv, **kwargs):
+            calls.append((argv, kwargs))
+            return CompletedProcess(argv, 0, json.dumps({"data": {"ok": True}}), "")
+
+        api = collector.GitHub(runner=runner)
+        query = "query($owner: String!, $name: String!, $number: Int!, $after: String) { __typename }"
+        api.graphql(query, {"owner": "false", "name": "123", "number": 42, "after": None})
+        api.graphql("query($thread: ID!, $after: String) { __typename }",
+                    {"thread": "@CURSOR-THREAD", "after": "null"})
+        first, second = [argv for argv, _ in calls]
+        self.assertEqual(first[-6:], ["-f", "owner=false", "-f", "name=123", "-F", "number=42"])
+        self.assertNotIn("after=", " ".join(first))
+        self.assertEqual(second[-4:], ["-f", "thread=@CURSOR-THREAD", "-f", "after=null"])
+        for argv, kwargs in calls:
+            self.assertNotIn("shell", kwargs)
+            self.assertEqual(kwargs["timeout"], 90)
 
     def test_transport_errors_do_not_expose_credential_bearing_stderr(self):
         runner = lambda argv, **kwargs: CompletedProcess(argv, 1, "", "Bearer very-private-token")

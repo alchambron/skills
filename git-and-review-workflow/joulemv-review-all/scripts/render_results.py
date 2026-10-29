@@ -11,6 +11,8 @@ import shutil
 import sys
 from urllib.parse import urlsplit
 
+from project_profiles import project_profile
+
 SCENARIO_STATUSES = ("pass", "fail", "blocked", "observed", "partial", "spec_gap")
 SECTION_STATUSES = {
     "review": ("pending", "clean", "issues", "blocked"),
@@ -75,7 +77,115 @@ def validate(data):
 
 
 def meaningful(value):
+    if isinstance(value, str):
+        return bool(value.strip())
     return value is not None and value != "" and value != [] and value != {}
+
+
+def outcome_summary(prs):
+    counts = {key: 0 for key in SCENARIO_STATUSES}
+    non_stale_counts = counts.copy()
+    for pr in prs:
+        for scenario in pr["scenarios"]:
+            counts[scenario["display_status"]] += 1
+            if pr["freshness"] == "current":
+                non_stale_counts[scenario["display_status"]] += 1
+    return {
+        "pr_count": len(prs), "scenario_count": sum(counts.values()),
+        "counts": counts, "current_counts": non_stale_counts, "non_stale_counts": non_stale_counts,
+        "stale_pr_count": sum(bool(pr["stale"]) for pr in prs),
+        "unknown_pr_count": sum(pr["freshness"] == "unknown" for pr in prs),
+        "unpinned_pr_count": sum(not pr["revision_available"] for pr in prs),
+    }
+
+
+def project_groups(prs):
+    """Keep presentation groups separate from resumable repository/number identities."""
+    groups = {}
+    for index, pr in enumerate(prs):
+        profile = project_profile(pr["repository"])
+        pr.update(profile)
+        project_id = profile["project_type"]
+        if project_id == "other":
+            project_id += ":" + pr["repository"].casefold()
+        group = groups.setdefault(project_id, {
+            "id": project_id, **profile, "pr_indexes": [], "repositories": [],
+        })
+        group["pr_indexes"].append(index)
+        repository = next((repo for repo in group["repositories"] if repo["repository"].casefold() == pr["repository"].casefold()), None)
+        if repository is None:
+            repository = {"repository": pr["repository"], "pr_indexes": []}
+            group["repositories"].append(repository)
+        repository["pr_indexes"].append(index)
+    for group in groups.values():
+        group.update(outcome_summary([prs[index] for index in group["pr_indexes"]]))
+        for repository in group["repositories"]:
+            repository.update(outcome_summary([prs[index] for index in repository["pr_indexes"]]))
+    return list(groups.values())
+
+
+def full_sha(value):
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{40}", value) is not None
+
+
+def live_evidence_gaps(pr):
+    """Check provenance without trusting the ledger's completion claim."""
+    live = pr.get("live", {})
+    gaps = []
+    scope = live.get("scope")
+    if scope not in ("pr-head-only", "integration", "technical"):
+        gaps.append("Test scope is not recorded as pr-head-only, integration, or technical")
+    commit = live.get("runtime_commit")
+    if not full_sha(commit):
+        gaps.append("Tested runtime/source commit is unavailable")
+    elif scope in ("pr-head-only", "technical") and commit.lower() != str(pr.get("head_sha", "")).lower():
+        gaps.append("Tested runtime/source commit differs from the pinned head")
+    if scope == "integration":
+        parents = live.get("integration_parents")
+        if not isinstance(parents, list) or len(parents) != 2 or not all(full_sha(parent) for parent in parents) or {parent.lower() for parent in parents} != {str(pr.get(key, "")).lower() for key in ("base_sha", "head_sha")}:
+            gaps.append("Integration commit parents do not match the pinned base and head")
+    environment = live.get("environment")
+    if not ((isinstance(environment, str) and environment.strip()) or (isinstance(environment, dict) and environment)):
+        gaps.append("Test environment is not recorded")
+    return gaps
+
+
+def cleanup_status(live):
+    if live.get("cleanup_required") is False and live.get("scope") == "technical" and isinstance(live.get("cleanup_reason"), str) and live["cleanup_reason"].strip():
+        return "not_required"
+    receipt = live.get("cleanup", {})
+    if isinstance(receipt, dict) and all(receipt.get(key) is True for key in ("database_dropped", "servers_stopped", "worktree_removed")):
+        return "complete"
+    return "pending"
+
+
+def next_actions(pr):
+    """Keep simultaneous blockers visible instead of reducing a PR to one verdict."""
+    actions = []
+    def add(kind, label):
+        actions.append({"kind": kind, "label": label})
+    if pr.get("pr_state") == "closed":
+        add("closed", "PR closed; retain evidence and finish owned cleanup only")
+        if pr.get("pending_cleanup") or pr["live"].get("cleanup_status") == "pending":
+            add("cleanup", "Verify owned resource cleanup")
+        return actions
+    if pr["freshness"] != "current":
+        add("refresh", "Refresh revision evidence" if pr["freshness"] == "unknown" else "Revalidate changed revision")
+    if pr["review"]["status"] == "issues" or pr["review"].get("findings") or any(s["display_status"] == "fail" for s in pr["scenarios"]):
+        add("fixes", "Address verified findings")
+    if pr["review"]["status"] in ("pending", "blocked"):
+        add("review", "Complete static review" if pr["review"]["status"] == "pending" else "Resolve review blocker")
+    if pr["publication"]["display_status"] in ("pending", "failed", "unverified"):
+        add("publication", "Complete publication/readback within authorized scope")
+    if pr["live"]["display_status"] == "blocked":
+        add("blocked", "Resolve test blocker")
+    elif pr["live"]["display_status"] in ("pending", "incomplete") or any(s["display_status"] not in ("pass", "fail") for s in pr["scenarios"]):
+        add("testing", "Complete planned checks and evidence")
+    if pr.get("pending_cleanup") or pr["live"].get("cleanup_status") == "pending":
+        add("cleanup", "Verify owned resource cleanup")
+    if not actions:
+        add("complete", "Recorded review and check scope complete; not approval")
+    return actions
 
 
 def publication_link_matches_pr(reference, pr):
@@ -99,8 +209,6 @@ def prepare(data, source_dir, output_dir):
     validate(data)
     data = copy.deepcopy(data)
     warnings = []
-    counts = {key: 0 for key in SCENARIO_STATUSES}
-    current_counts = {key: 0 for key in SCENARIO_STATUSES}
     copied = {}
 
     def retain(path, kind, label):
@@ -132,6 +240,7 @@ def prepare(data, source_dir, output_dir):
         pr["revision_available"] = all(bool(pr.get(f"{part}_sha")) for part in ("base", "head"))
         pr["stale"] = pr["revision_available"] and any(pr.get(f"current_{part}_sha") and pr[f"current_{part}_sha"] != pr[f"{part}_sha"] for part in ("base", "head"))
         pr["revision_refreshed"] = pr["revision_available"] and all(bool(pr.get(f"current_{part}_sha")) for part in ("base", "head"))
+        pr["freshness"] = "stale" if pr["stale"] else "current" if pr["revision_refreshed"] else "unknown"
         if not pr["revision_available"]:
             warnings.append(f"{label}: pinned revision unavailable; review is blocked and freshness cannot be checked")
         elif pr["stale"]:
@@ -155,6 +264,15 @@ def prepare(data, source_dir, output_dir):
                 warnings.append(f"{label}: {gap}")
         if not pr["scenarios"] and pr["live"]["status"] != "not_required":
             gaps.append("No live scenario results recorded")
+        live = pr["live"]
+        live["display_status"] = live["status"]
+        has_observations = any(s["status"] != "blocked" for s in pr["scenarios"])
+        provenance_gaps = live_evidence_gaps(pr) if has_observations or live["status"] == "complete" else []
+        live["evidence_gaps"] = provenance_gaps
+        if has_observations or live["status"] == "complete" or "cleanup" in live or "runtime_commit" in live:
+            live["cleanup_status"] = cleanup_status(live)
+        else:
+            live.pop("cleanup_status", None)
         for scenario in pr["scenarios"]:
             scenario["display_status"] = scenario["status"]
             scenario["evidence_gaps"] = list(scenario.get("evidence_gaps", []))
@@ -166,6 +284,9 @@ def prepare(data, source_dir, output_dir):
                 scenario["display_status"] = "partial"
                 scenario["evidence_gaps"].append("Recorded pass lacks expected/actual observations or runnable steps; shown as partial")
                 warnings.append(f"{case_label}: incomplete pass evidence; shown as partial")
+            if pr["revision_available"] and scenario["status"] in ("pass", "fail") and provenance_gaps:
+                scenario["display_status"] = "partial"
+                scenario["evidence_gaps"].extend(provenance_gaps)
             screenshots = []
             for path in scenario.get("screenshots", []):
                 saved = retain(path, "screenshot", case_label)
@@ -189,10 +310,16 @@ def prepare(data, source_dir, output_dir):
                 if not meaningful(export.get("verification")):
                     scenario["evidence_gaps"].append(f"Export contents not verified: {export['file_name']}")
             scenario["evidence_gaps"] = list({json.dumps(gap, sort_keys=True): gap for gap in scenario["evidence_gaps"]}.values())
-            counts[scenario["display_status"]] += 1
-            if pr["revision_available"] and not pr["stale"]:
-                current_counts[scenario["display_status"]] += 1
-    data["report"] = {"counts": counts, "non_stale_counts": current_counts, "stale_pr_count": sum(bool(p["stale"]) for p in data["prs"]), "unpinned_pr_count": sum(not p["revision_available"] for p in data["prs"]), "warnings": warnings}
+        if live["status"] == "complete":
+            if not pr["scenarios"]:
+                live["evidence_gaps"].append("No acceptance scenarios recorded")
+            elif any(s["display_status"] not in ("pass", "fail") for s in pr["scenarios"]):
+                live["evidence_gaps"].append("Planned checks include blocked or incomplete acceptance evidence")
+            if live["evidence_gaps"]:
+                live["display_status"] = "incomplete"
+        warnings.extend(f"{label}: {gap}" for gap in live["evidence_gaps"])
+        pr["next_actions"] = next_actions(pr)
+    data["report"] = {**outcome_summary(data["prs"]), "projects": project_groups(data["prs"]), "warnings": warnings}
     return data
 
 

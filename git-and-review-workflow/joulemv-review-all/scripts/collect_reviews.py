@@ -10,6 +10,8 @@ import sys
 from pathlib import Path
 from urllib.parse import urlencode, urlparse
 
+from project_profiles import project_profile
+
 
 COMPONENT = re.compile(r"[A-Za-z0-9_.-]+\Z")
 HOST = re.compile(r"[A-Za-z0-9.-]+\Z")
@@ -65,8 +67,20 @@ class GitHub:
             endpoint += "?" + urlencode(parameters)
         return self._execute(["gh", "api", "--hostname", self.host, "--method", "GET", endpoint])
 
-    def graphql(self, query):
-        result = self._execute(["gh", "api", "--hostname", self.host, "graphql", "-f", "query=" + query])
+    def graphql(self, query, variables=None):
+        arguments = ["gh", "api", "--hostname", self.host, "graphql", "-f", "query=" + query]
+        for key, value in (variables or {}).items():
+            if value is None:
+                # Omitted nullable variables default to null without a cursor field.
+                continue
+            if type(value) is int:
+                arguments.extend(["-F", f"{key}={value}"])
+            elif isinstance(value, str):
+                # Raw fields preserve strings such as "null", "123", or "@path".
+                arguments.extend(["-f", f"{key}={value}"])
+            else:
+                raise CollectionError("Unsupported GraphQL variable type")
+        result = self._execute(arguments)
         if not isinstance(result, dict) or result.get("errors") or not result.get("data"):
             raise CollectionError("GraphQL context failed or returned partial data")
         return result["data"]
@@ -156,18 +170,17 @@ def collect_threads(api, owner, repository, number, target):
     complete, error = True, None
     try:
         for _ in range(100):
-            after = ", after: " + json.dumps(cursor) if cursor else ""
-            query = """query {
-              repository(owner: OWNER, name: REPO) { pullRequest(number: NUMBER) {
-                reviewThreads(first: 100AFTER) {
+            query = """query($owner: String!, $name: String!, $number: Int!, $after: String) {
+              repository(owner: $owner, name: $name) { pullRequest(number: $number) {
+                reviewThreads(first: 100, after: $after) {
                   pageInfo { hasNextPage endCursor }
                   nodes { id isResolved isOutdated path line originalLine startLine originalStartLine diffSide
                     comments(first: 100) { totalCount pageInfo { hasNextPage endCursor } nodes { id databaseId } }
                   }
                 }
               } }
-            }""".replace("OWNER", json.dumps(owner)).replace("REPO", json.dumps(repository)).replace("NUMBER", str(number)).replace("AFTER", after)
-            data = api.graphql(query)
+            }"""
+            data = api.graphql(query, {"owner": owner, "name": repository, "number": number, "after": cursor})
             try:
                 connection = data["repository"]["pullRequest"]["reviewThreads"]
                 nodes = connection["nodes"]
@@ -189,9 +202,8 @@ def collect_threads(api, owner, repository, number, target):
                     if not comment_cursor or comment_cursor in used:
                         raise CollectionError("Review-thread comments cursor did not advance")
                     used.add(comment_cursor)
-                    nested = "query { node(id: THREAD) { ... on PullRequestReviewThread { comments(first: 100, after: CURSOR) { totalCount pageInfo { hasNextPage endCursor } nodes { id databaseId } } } } }"
-                    nested = nested.replace("THREAD", json.dumps(thread["id"])).replace("CURSOR", json.dumps(comment_cursor))
-                    result = api.graphql(nested)
+                    nested = "query($thread: ID!, $after: String) { node(id: $thread) { ... on PullRequestReviewThread { comments(first: 100, after: $after) { totalCount pageInfo { hasNextPage endCursor } nodes { id databaseId } } } } }"
+                    result = api.graphql(nested, {"thread": thread["id"], "after": comment_cursor})
                     try:
                         comment_connection = result["node"]["comments"]
                         comment_nodes.extend(comment_connection["nodes"])
@@ -242,6 +254,7 @@ def collect_pr(api, hit, login, output):
               "title": hit.get("title", ""), "base_sha": None, "head_sha": None,
               "draft": None, "artifact_dir": str(directory),
               "coverage": {"complete": False, "warnings": [], "artifacts": {}}}
+    record.update(project_profile(record["repository"]))
     coverage = record["coverage"]
     warnings = coverage["warnings"]
     try:
