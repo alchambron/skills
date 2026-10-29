@@ -10,8 +10,8 @@ import sys
 
 
 ACTOR = "author { login __typename }"
-COMMENT = "id body url createdAt updatedAt " + ACTOR
-REVIEW = "id body url submittedAt state " + ACTOR
+COMMENT = "id body url createdAt updatedAt lastEditedAt " + ACTOR
+REVIEW = "id body url submittedAt lastEditedAt state " + ACTOR
 PAGE = "pageInfo { hasNextPage endCursor hasPreviousPage startCursor }"
 THREAD = "id isResolved isOutdated comments(last:100) { " + PAGE + " nodes { " + COMMENT + " } }"
 COMMIT = "commit { oid committedDate pushedDate }"
@@ -60,25 +60,35 @@ def graphql(query, variables=None):
 
 
 def discover(login, repos):
-    query_text = "is:pr is:open author:" + login
-    query_text += "".join(" repo:" + repo for repo in repos)
     query = (
-        "query($q:String!,$cursor:String) { search(query:$q,type:ISSUE,"
-        "first:100,after:$cursor) { issueCount " + PAGE
-        + " nodes { ... on PullRequest { " + META + " } } } }"
+        "query($cursor:String) { viewer { pullRequests(states:[OPEN],"
+        "first:100,after:$cursor) { " + PAGE
+        + " nodes { " + META + " } } } }"
     )
+    allowed_repos = {repo.casefold() for repo in repos}
     cursor = None
+    seen_cursors = set()
+    seen_prs = set()
     found = []
     while True:
-        page = graphql(query, {"q": query_text, "cursor": cursor})["search"]
-        if page["issueCount"] > 1000:
-            raise RuntimeError("GitHub search exceeds 1000 PRs; restrict with --repo")
-        found.extend(page["nodes"])
+        page = graphql(query, {"cursor": cursor})["viewer"]["pullRequests"]
+        for pr in page["nodes"]:
+            if not pr:
+                raise RuntimeError("PR became inaccessible during discovery")
+            author = pr.get("author")
+            if not author or author["login"].casefold() != login.casefold() or pr["state"] != "OPEN":
+                continue
+            if allowed_repos and pr["repository"]["nameWithOwner"].casefold() not in allowed_repos:
+                continue
+            if pr["id"] not in seen_prs:
+                found.append(pr)
+                seen_prs.add(pr["id"])
         if not page["pageInfo"]["hasNextPage"]:
             return found
         next_cursor = page["pageInfo"]["endCursor"]
-        if not next_cursor or next_cursor == cursor:
-            raise RuntimeError("PR search pagination did not advance")
+        if not next_cursor or next_cursor in seen_cursors:
+            raise RuntimeError("PR discovery pagination did not advance")
+        seen_cursors.add(next_cursor)
         cursor = next_cursor
 
 
@@ -161,7 +171,10 @@ def evaluate(pr, detail, login):
                 comment["createdAt"], comment.get("updatedAt") or comment["createdAt"],
             ), "url": comment["url"]})
         elif is_other_human(author, login) and comment["body"].strip() and not resolved:
-            feedback.append({"kind": kind, "date": comment["createdAt"],
+            date = max(
+                comment["createdAt"], comment.get("lastEditedAt") or "",
+            )
+            feedback.append({"kind": kind, "date": date,
                              "url": comment["url"], "author": author["login"],
                              "body": comment["body"]})
 
@@ -174,6 +187,8 @@ def evaluate(pr, detail, login):
         date = review.get("submittedAt")
         if not date or review["state"] == "PENDING":
             continue
+        # Body edits refresh feedback, not the order of review decisions.
+        date = max(date, review.get("lastEditedAt") or "")
         author = review.get("author")
         if author and author["login"] == login:
             actions.append({"kind": "review", "date": date, "url": review["url"]})
@@ -223,9 +238,20 @@ def main():
     scope.add_argument("--pr", action="append", default=[], help="Revalidate a full PR URL (repeatable)")
     args = parser.parse_args()
     login = graphql("query { viewer { login } }")["viewer"]["login"]
-    prs = [get_pr(url) for url in args.pr] if args.pr else discover(login, args.repo)
     report = {"viewer": login, "collectedAt": datetime.now(timezone.utc).isoformat(),
-              "scanned": len(prs), "matches": [], "excluded": [], "unavailable": []}
+              "scanned": 0, "matches": [], "excluded": [], "unavailable": []}
+    if args.pr:
+        prs = []
+        for url in args.pr:
+            try:
+                prs.append(get_pr(url))
+            except (RuntimeError, ValueError, subprocess.TimeoutExpired) as error:
+                report["unavailable"].append({"url": url, "error": str(error)})
+        # Count attempted PRs, including URLs whose lookup failed.
+        report["scanned"] = len(args.pr)
+    else:
+        prs = discover(login, args.repo)
+        report["scanned"] = len(prs)
     pending = []
     for pr in prs:
         if pr.get("reviewDecision") == "APPROVED":
