@@ -26,6 +26,7 @@ import subprocess
 import sys
 
 URL = re.compile(r"https://github\.com/([^/]+)/([^/]+)/pull/(\d+)/?")
+KEY = re.compile(r"[A-Za-z0-9._:-]{1,100}")
 
 
 class PublishError(Exception):
@@ -83,10 +84,17 @@ def load_plan(path):
         reviewers = [r if isinstance(r, str) else r["login"] for r in data.get("reviewers", [])
                      if isinstance(r, str) or r.get("request", True)]
     for reply in replies:
+        reply["key"] = str(reply.get("key", ""))
+        if not KEY.fullmatch(reply["key"]):
+            raise PublishError(f"{path}: reply key {reply['key']!r} must match {KEY.pattern}")
         if reply.get("kind") not in ("inline", "conversation") or not reply.get("body"):
-            raise PublishError(f"{path}: reply {reply.get('key')} needs kind inline|conversation and body")
-        if reply["kind"] == "inline" and not reply.get("inReplyTo"):
-            raise PublishError(f"{path}: inline reply {reply.get('key')} needs inReplyTo")
+            raise PublishError(f"{path}: reply {reply['key']} needs kind inline|conversation and body")
+        if reply["kind"] == "inline":
+            # The ID becomes part of an API path: accept only a positive integer.
+            target = str(reply.get("inReplyTo", ""))
+            if not target.isdigit() or int(target) <= 0:
+                raise PublishError(f"{path}: inline reply {reply['key']} needs a numeric inReplyTo")
+            reply["inReplyTo"] = int(target)
     owner, repo, number = match.groups()
     return {"path": Path(path), "url": url, "repo": f"{owner}/{repo}", "number": int(number),
             "head": head, "analyzedAt": analyzed_at, "replies": replies,
@@ -154,6 +162,11 @@ def publish(plan, viewer, dry_run, journal_dir):
         if existing:
             journal.record("replies", key, status="verified", outcome="existing", url=existing["html_url"])
             lines.append(f"{tag}\treply {key}\texisting\t{existing['html_url']}")
+            continue
+        if reply["kind"] == "inline" and not any(c["id"] == reply["inReplyTo"] for c in review_comments):
+            blocked += 1
+            journal.record("replies", key, status="blocked", error="inReplyTo is not a review comment on this PR")
+            lines.append(f"{tag}\treply {key}\tblocked\tinReplyTo {reply['inReplyTo']} is not on this PR")
             continue
         if dry_run:
             lines.append(f"{tag}\treply {key}\twould post {reply['kind']}")

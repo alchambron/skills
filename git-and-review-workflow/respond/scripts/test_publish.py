@@ -89,15 +89,20 @@ class PublishTests(unittest.TestCase):
     def journal(self):
         return json.loads((self.dir / "pr-7-publication.json").read_text())
 
+    def seed_thread(self, fake):
+        fake.review_comments.append({"id": 11, "body": "fix this", "user": fake.user("alice"),
+                                     "created_at": "2026-10-29T00:00:00Z", "html_url": "h11"})
+
     def test_posts_replies_then_requests_reviewers_with_readback(self):
         fake = FakeGitHub()
+        self.seed_thread(fake)
         fake.reviews = [{"user": fake.user("bob"), "commit_id": "abc", "state": "COMMENTED",
                          "submitted_at": "2026-10-29T00:00:00Z", "html_url": "r"}]
         code, lines = self.run_publish(fake, self.plan())
         self.assertEqual(code, 0)
-        self.assertEqual(len(fake.review_comments), 1)
+        self.assertEqual(len(fake.review_comments), 2)
         self.assertEqual(len(fake.issue_comments), 1)
-        self.assertIn("<!-- respond-all 11 2026-10-30T10:00:00Z -->", fake.review_comments[0]["body"])
+        self.assertIn("<!-- respond-all 11 2026-10-30T10:00:00Z -->", fake.review_comments[1]["body"])
         self.assertEqual(fake.requested, ["alice"])
         journal = self.journal()
         self.assertEqual(journal["status"], "complete")
@@ -108,10 +113,11 @@ class PublishTests(unittest.TestCase):
 
     def test_rerun_is_idempotent(self):
         fake = FakeGitHub()
+        self.seed_thread(fake)
         self.run_publish(fake, self.plan())
         code, lines = self.run_publish(fake, self.plan())
         self.assertEqual(code, 0)
-        self.assertEqual(len(fake.review_comments) + len(fake.issue_comments), 2)
+        self.assertEqual(len(fake.review_comments) + len(fake.issue_comments), 3)
         self.assertTrue(any("existing" in line for line in lines))
         self.assertIn("Already requested", "\n".join(lines))
 
@@ -125,12 +131,13 @@ class PublishTests(unittest.TestCase):
 
     def test_new_human_feedback_after_analysis_is_stale_but_bots_are_not(self):
         fake = FakeGitHub()
+        self.seed_thread(fake)
         fake.issue_comments = [{"id": 1, "body": "bot", "user": fake.user("coderabbitai[bot]", "Bot"),
                                 "created_at": "2026-10-30T11:00:00Z", "html_url": "b"}]
         code, _ = self.run_publish(fake, self.plan(), "--dry-run")
         self.assertEqual(code, 0)
-        fake.review_comments = [{"id": 2, "body": "one more", "user": fake.user("alice"),
-                                 "created_at": "2026-10-30T11:00:00Z", "html_url": "h"}]
+        fake.review_comments.append({"id": 2, "body": "one more", "user": fake.user("alice"),
+                                     "created_at": "2026-10-30T11:00:00Z", "html_url": "h"})
         code, lines = self.run_publish(fake, self.plan())
         self.assertEqual(code, 3)
         self.assertIn("re-analyze", lines[0])
@@ -138,6 +145,7 @@ class PublishTests(unittest.TestCase):
 
     def test_dry_run_writes_nothing(self):
         fake = FakeGitHub()
+        self.seed_thread(fake)
         code, lines = self.run_publish(fake, self.plan(), "--dry-run")
         self.assertEqual(code, 0)
         self.assertFalse([c for c in fake.calls if c[0] == "POST"])
@@ -146,6 +154,7 @@ class PublishTests(unittest.TestCase):
 
     def test_failed_review_request_is_blocked_and_journaled(self):
         fake = FakeGitHub()
+        self.seed_thread(fake)
         fake.unrequestable = {"bob"}
         code, lines = self.run_publish(fake, self.plan())
         self.assertEqual(code, 1)
@@ -166,6 +175,29 @@ class PublishTests(unittest.TestCase):
         self.assertEqual([(r["key"], r["kind"], r["inReplyTo"]) for r in plan["replies"]],
                          [("11", "inline", 11), ("review-5", "conversation", None)])
         self.assertEqual(plan["reviewers"], ["alice"])
+
+    def test_unsafe_ids_and_keys_are_rejected_before_any_request(self):
+        for reply in ({"key": "11", "kind": "inline", "inReplyTo": "../../../user/repos", "body": "x"},
+                      {"key": "11", "kind": "inline", "inReplyTo": -4, "body": "x"},
+                      {"key": "a --> b", "kind": "conversation", "body": "x"}):
+            with self.subTest(reply=reply):
+                fake = FakeGitHub()
+                code, lines = self.run_publish(fake, self.plan(replies=[reply]))
+                self.assertEqual(code, 1)
+                self.assertEqual(fake.calls, [("GET", "user")])
+
+    def test_inline_target_must_belong_to_this_pr(self):
+        fake = FakeGitHub()
+        fake.review_comments = [{"id": 11, "body": "fix this", "user": fake.user("alice"),
+                                 "created_at": "2026-10-29T00:00:00Z", "html_url": "h11"}]
+        plan = self.plan(replies=[{"key": "12", "kind": "inline", "inReplyTo": 12, "body": "x"},
+                                  {"key": "11", "kind": "inline", "inReplyTo": "11", "body": "y"}],
+                         reviewers=[])
+        code, lines = self.run_publish(fake, plan)
+        self.assertEqual(code, 1)
+        self.assertIn("not on this PR", lines[0])
+        self.assertEqual([c for c in fake.calls if c[0] == "POST"],
+                         [("POST", f"{BASE}/pulls/7/comments/11/replies")])
 
     def test_invalid_plan_is_reported_per_file(self):
         bad = self.dir / "bad.json"
