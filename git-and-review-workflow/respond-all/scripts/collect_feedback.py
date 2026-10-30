@@ -7,6 +7,7 @@ import json
 import re
 import subprocess
 import sys
+from pathlib import Path
 
 
 ACTOR = "author { login __typename }"
@@ -43,6 +44,44 @@ DETAIL = "id " + " ".join(
     + ") { " + PAGE + " nodes { " + fields + " } }"
     for field, (fields, forward, extra) in CONNECTIONS.items()
 )
+
+
+# A COMMENTED review body or conversation comment that only reports "no findings"
+# needs no response work. Any question or request wording keeps it actionable.
+NO_FINDINGS = re.compile(
+    r"\bno (?:verified |distinct |blocking |remaining )?(?:actionable |new )?"
+    r"(?:findings?|issues?|defects?|concerns?|problems?|comments?)\b"
+    r"|\bno verified \w+ defect\b|\blgtm\b|\blooks good(?: to me)?\b",
+    re.IGNORECASE,
+)
+# Questions, requests and cross-PR references ("the issue on #123 also affects...")
+# need analysis even inside a no-findings summary.
+REQUEST = re.compile(
+    r"\?|#\d+|\b(?:please|could you|can you|would you|should|needs?|must|rebase|"
+    r"update from|affects?)\b",
+    re.IGNORECASE,
+)
+BODY_LIMIT = 600
+PRIORITY_RANK = {"priority:high": 0, "high": 0, "urgent ticket": 0,
+                 "priority:medium": 1, "medium": 1, "priority:low": 3, "low": 3}
+
+
+def is_low_signal(item, number=None):
+    # A mention of the PR's own number is not a cross-PR reference.
+    body = re.sub(rf"#{number}\b", "", item["body"]) if number else item["body"]
+    return item["kind"] in ("COMMENTED", "comment") and bool(
+        NO_FINDINGS.search(body)) and not REQUEST.search(body)
+
+
+def excerpt(body):
+    body = " ".join(body.split())
+    return body if len(body) <= BODY_LIMIT else body[:BODY_LIMIT] + "…"
+
+
+def processing_order(match):
+    """Highest merge priority first, then the feedback that has waited longest."""
+    rank = min((PRIORITY_RANK.get(label.casefold(), 2) for label in match["labels"]), default=2)
+    return rank, match["feedback"]["date"]
 
 
 def graphql(query, variables=None):
@@ -223,10 +262,17 @@ def evaluate(pr, detail, login):
     later = [event for event in actions if event["date"] > latest["date"]]
     if later:
         return None, "author_acted_or_branch_updated_after_feedback"
+    last_action = max((event["date"] for event in actions), default="")
+    untouched = sorted((item for item in feedback if item["date"] > last_action),
+                       key=lambda item: item["date"])
     return {
         "repository": pr["repository"]["nameWithOwner"], "number": pr["number"],
         "title": pr["title"], "url": pr["url"], "headSha": pr["headRefOid"],
-        "reviewDecision": pr.get("reviewDecision"), "feedback": latest,
+        "reviewDecision": pr.get("reviewDecision"),
+        "signal": "low" if all(is_low_signal(item, pr["number"]) for item in untouched) else "actionable",
+        "feedback": {**latest, "body": excerpt(latest["body"])},
+        "untouched": [{key: item[key] for key in ("kind", "date", "url", "author")}
+                      for item in untouched],
         "labels": [label["name"] for label in detail["labels"]],
     }, None
 
@@ -236,10 +282,14 @@ def main():
     scope = parser.add_mutually_exclusive_group()
     scope.add_argument("--repo", action="append", default=[], help="Restrict to OWNER/REPO (repeatable)")
     scope.add_argument("--pr", action="append", default=[], help="Revalidate a full PR URL (repeatable)")
+    parser.add_argument("--include-low-signal", action="store_true",
+                        help="Keep no-findings-only PRs in matches instead of lowSignal")
+    parser.add_argument("--out", type=Path,
+                        help="Write the JSON report here and print one compact line per PR")
     args = parser.parse_args()
     login = graphql("query { viewer { login } }")["viewer"]["login"]
     report = {"viewer": login, "collectedAt": datetime.now(timezone.utc).isoformat(),
-              "scanned": 0, "matches": [], "excluded": [], "unavailable": []}
+              "scanned": 0, "matches": [], "lowSignal": [], "excluded": [], "unavailable": []}
     if args.pr:
         prs = []
         for url in args.pr:
@@ -274,16 +324,41 @@ def main():
                 if not node:
                     raise RuntimeError("PR became inaccessible during collection")
                 match, reason = evaluate(pr, complete_detail(node), login)
-                if match:
+                if match and match["signal"] == "low" and not args.include_low_signal:
+                    report["lowSignal"].append(match)
+                elif match:
                     report["matches"].append(match)
                 else:
                     report["excluded"].append({"url": pr["url"], "reason": reason})
             except (RuntimeError, subprocess.TimeoutExpired) as error:
                 report["unavailable"].append({"url": pr["url"], "error": str(error)})
-    report["matches"].sort(key=lambda pr: pr["feedback"]["date"], reverse=True)
+    report["matches"].sort(key=processing_order)
+    report["lowSignal"].sort(key=processing_order)
     report["complete"] = not report["unavailable"]
-    print(json.dumps(report, indent=2))
+    if args.out:
+        args.out.write_text(json.dumps(report, indent=2) + "\n")
+        print_compact(report, args.out)
+    else:
+        print(json.dumps(report, indent=2))
     return 0 if report["complete"] else 2
+
+
+def print_compact(report, path):
+    print(f"viewer={report['viewer']} scanned={report['scanned']} "
+          f"matches={len(report['matches'])} lowSignal={len(report['lowSignal'])} "
+          f"excluded={len(report['excluded'])} unavailable={len(report['unavailable'])} "
+          f"complete={str(report['complete']).lower()} report={path}")
+    for section in ("matches", "lowSignal"):
+        for match in report[section]:
+            latest = match["feedback"]
+            print("\t".join([
+                section, f"{match['repository']}#{match['number']}",
+                ",".join(match["labels"]) or "-", f"untouched={len(match['untouched'])}",
+                f"{latest['kind']}:{latest['author']}:{latest['date']}",
+                match["title"][:70],
+            ]))
+    for item in report["unavailable"]:
+        print(f"unavailable\t{item['url']}\t{item['error'][:120]}")
 
 
 if __name__ == "__main__":

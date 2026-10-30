@@ -1,39 +1,42 @@
 # Checkpoint and resume
 
-The parent owns one durable ledger per run. Create a unique directory under `${CODEX_HOME:-$HOME/.codex}/review-runs/respond-all-<UTC timestamp>-<unique suffix>/` and record its absolute path in the conversation. Store `ledger.json` and linked analyzer reports, dispositions and drafts there, outside repository checkouts. Record each child's report in this directory before its checkout or context is released.
+The parent owns one ledger per run at `${CODEX_HOME:-$HOME/.codex}/review-runs/respond-all-<UTC timestamp>-<suffix>/ledger.json`, created by `ledger.py init`. Record the run directory's path in the conversation. Every artifact lives in that directory: discovery, analyzer reports, raw evidence, publish plans and publication journals. The ledger records their paths, never copies of their content; `ledger.py` rejects operations over 8 KB.
 
-## Ledger format
+## Writing
 
-Use JSON with `schemaVersion: 1`. Preserve the initial queue and its evidence; update current state separately. These fields are required, with empty arrays or null for information not yet collected:
+Change the ledger only through `ledger.py apply RUN_DIR`, which takes a JSON list of operations. One locked, fsynced, atomic write covers the whole list; an invalid operation leaves the previous ledger untouched. Children may record their own PR's entry the same way, and the lock serializes them with the parent.
+
+```bash
+python3 ~/.codex/skills/respond-all/scripts/ledger.py apply "$RUN_DIR" <<'EOF'
+[{"pr": "https://github.com/O/R/pull/7", "set": {"phase": "fix", "status": "running", "child": {"taskId": "T", "requestId": "R"}}},
+ {"pr": "https://github.com/O/R/pull/7", "report": {"analysis": "pr-7-analysis.json"}},
+ {"pr": "https://github.com/O/R/pull/7", "reviewer": {"login": "alice", "reviewId": 5, "changeRequest": true, "reviewedHead": "SHA"}},
+ {"run": {"executionAuthorizedAt": "2026-10-30T13:04:00Z", "authorizationEvidence": "Go for it execute the plan"}}]
+EOF
+```
+
+`ledger.py --help` lists the operations: `run`, `create`, `set`, `action`, `reviewer`, `comment`, `report` and `blocker`.
+
+Write once per wake-up, before yielding, covering every child result, authorization change and phase transition of that wake-up. Publication intent and readback are journaled per action by `publish.py` in `pr-NUMBER-publication.json`; the ledger records the journal path and the PR's resulting status.
+
+## Fields
 
 | Location | Fields |
 | --- | --- |
-| Run | `runId`, `schemaVersion`, `createdAt`, `updatedAt`, `scope`, `initialQueue` (PR URLs), `coverageGaps`, `prs` (object keyed by PR URL) |
-| Resource scheduling | `resourceLimits` (maximum active children, fixers and CPU-heavy local operations), plus the current local-operation owner; for older ledgers without limits, apply the skill's defaults |
-| PR | `repository`, `url`, `initialHeadSha`, `currentHeadSha`, `baseSha`, `labels`, `labelsCollectedAt`, `triggeringFeedback` (stable ID/URL/date), `reviewers`, `authorization`, `phase`, `status`, `child`, `reports`, `comments`, `actions`, `watcher`, `blockers` |
-| Reviewer | Login, original review ID/URL/state, reviewed head, associated comment/thread IDs, whether addressed, and final-head review-request outcome with readback evidence |
-| Authorization | Granted action categories and their user-message evidence, plus explicit limits; preserve per-PR scope |
-| Child | Mechanism, task ID, phase, request ID when supported, worktree and assigned head |
-| Comment | Original comment ID/URL, thread ID, reviewer, disposition, draft/report path, verification and outcome |
-| Action | Stable `key`, `kind`, `target`, `headSha`, `status`, `intentAt`, `observedAt`, `evidence`, `error` |
-| Watcher | PR URL, last observed watched head, state and observation time |
+| Run | `runId`, `schemaVersion`, `createdAt`, `updatedAt`, `scope`, `initialQueue`, `deferred`, `lowSignal`, `coverageGaps`, `resourceLimits`, `localOperationOwner`, `prs` |
+| PR | `repository`, `url`, `number`, `initialHeadSha`, `currentHeadSha`, `baseSha`, `labels`, `labelsCollectedAt`, `triggeringFeedback`, `untouched`, `reviewers`, `authorization`, `phase`, `status`, `child`, `reports`, `comments`, `actions`, `watcher`, `blockers`, `fixRounds` |
+| Reviewer | `login`, original review ID/URL/state, `reviewedHead`, comment IDs, `changeRequest`, addressed, final-head request outcome |
+| Authorization | Granted categories with the user's words as evidence, explicit limits, per-PR scope |
+| Child | Mechanism, task ID, request ID, phase, worktree, assigned head |
 
-Use phases `analysis`, `fix`, `publish`, `respond`, `monitor`, `done`; statuses `queued`, `running`, `awaiting_authorization`, `blocked`, `completed`, `skipped`. Action statuses are `planned`, `in_flight`, `verified`, `blocked`. A terminal PR status does not erase outstanding drafts or excluded actions; record explicit user limits and remaining work.
+Phases: `queued`, `analysis`, `fix`, `publish`, `respond`, `monitor`, `done`, `blocked`. Statuses: `queued`, `running`, `awaiting_authorization`, `blocked`, `completed`, `skipped`. Action statuses: `planned`, `in_flight`, `verified`, `blocked`. A terminal status keeps outstanding drafts and excluded actions visible. The ledger records authorization; it cannot grant it.
 
-Give each action a stable key based on PR URL, action kind and target: a reply targets its original comment/thread ID; a reviewer request targets the reviewer and final head; a push targets the branch and intended SHA. Record commit SHAs, reply URLs, reviewer-request readbacks and CI observations in `evidence`, keeping each type separate. Store full content in linked report files when needed. The ledger records authorization; it cannot grant or expand it.
+## Resume
 
-## Write timing
+1. Locate the run named by the conversation or the user and run `ledger.py summary RUN_DIR`. If the run cannot be identified, ask which one. A missing or invalid ledger is reconstructed from the run directory's reports and journals before any external action.
+2. Re-check unfinished PRs in one call with `collect_feedback.py --pr URL ... --include-low-signal`, and refresh head, state, labels, review requests and checks. A push, reply or approval can drop a PR from fresh discovery without completing its authorized lifecycle; keep such entries until their outstanding actions are reconciled. A closed or merged PR gets an explicit recorded disposition.
+3. Re-run `publish.py` on any PR whose journal is not `complete`. Its markers and request checks make the replay idempotent: existing replies are recorded rather than duplicated, and pending or satisfied review requests are not re-sent. A pushed head that differs from the plan makes it stop as stale, and the PR returns to analysis.
+4. Reconcile existing child tasks through the supported mechanism before dispatching duplicates, keeping request IDs stable. Follow running T3 delegates' returned `next` instructions. Verify watcher state, and release a `localOperationOwner` whose task has ended.
+5. A PR interrupted after a verified push but before publication stays in `respond`: run `publish.py` on its plan right away. Queued or running CI does not block replies or review requests.
 
-Write the initial ledger before dispatch. Checkpoint after every child result, authorization change, phase transition and verified external action, and before yielding or handing back. One parent writes the ledger; children return evidence to it.
-
-Before an external action, save its exact intent and `in_flight` status. Afterward, read the resulting state back and checkpoint the evidence as `verified`; failures or uncertainty remain recorded. Use atomic replacement: write valid JSON to a temporary file in the same directory, flush and fsync it, then replace `ledger.json`. Keep the previous valid ledger if writing fails, and stop new external actions until checkpointing works.
-
-## Resume procedure
-
-1. Locate the run named in the conversation or by the user and load its ledger and referenced reports. If the requested run cannot be identified, ask which run to continue. A missing or invalid ledger requires reconstruction from available reports and conversation evidence before resuming external actions; do not assume an empty queue or completed work.
-2. Reconcile unfinished entries directly by PR URL. Refresh head/base, open/closed state, labels, relevant comments, reviews, review requests and checks. A push, reply or approval may remove a PR from fresh discovery without completing its authorized lifecycle. Preserve those entries until the outstanding actions are reconciled. Closed or merged PRs need an explicit recorded disposition rather than automatic further publication.
-3. Reconcile `in_flight` actions before retrying. For a push, compare the observed remote SHA and ancestry with the intended commit. For a reply, inspect the original thread/conversation for the expected author and content and record an adequate existing reply. For a review request, inspect current requests and subsequent reviews on the final head; retain the saved original change-request reviewers even if GitHub no longer shows their old review state. Verify watcher state through the available mechanism and reconcile the recorded local-operation owner before reusing its slot. If the effect cannot be determined, mark that action blocked and continue independent work; do not blindly repeat it.
-4. Reuse documented authorization within its original scope and apply later user limits. Compare the live head with the last verified head and known child/published commits. Resume remaining replies and review requests after a verified own push; obtain fresh child analysis before applying a plan to an unexpected head. Refresh drafts and verification claims to match the actual published head.
-5. Reconcile existing child tasks through the supported mechanism before creating duplicates, preserving request IDs across retries. Follow running T3 delegates' returned `next` instructions; use notification-driven continuation. Resume only unfinished, authorized phases and checkpoint the reconciled state before further side effects.
-
-A PR interrupted after a successful push but before replies remains in phase `respond`, even when the collector now excludes it as author activity. Record the verified push, then finish its authorized replies and reviewer requests immediately, before waiting for CI. Queued or running CI does not block those actions. Continue monitoring CI and human review concurrently after the request readback. Do not reapply the fix or infer those later steps succeeded from the push.
+Ledgers from earlier runs (schema 1, without limits) are read with the current defaults, and their extra fields are preserved.
