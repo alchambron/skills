@@ -3,7 +3,9 @@
 import contextlib
 import io
 import json
+from pathlib import Path
 import subprocess
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -128,9 +130,81 @@ class EditedFeedbackTests(unittest.TestCase):
                 self.assertEqual(match is None, expected is not None)
 
 
+NO_FINDINGS = "Reviewed this layer against the PR description; no actionable findings. Tests were not run."
+
+
+class SignalTests(unittest.TestCase):
+    def evaluate(self, *items):
+        data = detail()
+        for kind, item in items:
+            if kind == "thread":
+                data["reviewThreads"].append({"isResolved": False, "comments": [item]})
+            else:
+                data[kind].append(item)
+        match, reason = collector.evaluate(pr(), data, "owner")
+        self.assertIsNone(reason)
+        return match
+
+    def body(self, item, text):
+        item["body"] = text
+        return item
+
+    def test_no_findings_review_body_is_low_signal(self):
+        for text in (NO_FINDINGS, "No verified actionable findings in this layer.", "LGTM"):
+            with self.subTest(text=text):
+                match = self.evaluate(("reviews", self.body(review(), text)))
+                self.assertEqual(match["signal"], "low")
+
+    def test_requests_questions_and_cross_references_stay_actionable(self):
+        for text in (
+            NO_FINDINGS + " Please rebase.", NO_FINDINGS + " Why skip the cache?",
+            NO_FINDINGS + " The issue raised on #1786 also affects reports.",
+            NO_FINDINGS + " The migration number needs a collision check.",
+            "Handle the null case.",
+        ):
+            with self.subTest(text=text):
+                match = self.evaluate(("reviews", self.body(review(), text)))
+                self.assertEqual(match["signal"], "actionable")
+
+    def test_own_pr_number_is_not_a_cross_reference(self):
+        match = self.evaluate(("reviews", self.body(review(), NO_FINDINGS + " No threads existed on #1.")))
+        self.assertEqual(match["signal"], "low")
+        match = self.evaluate(("reviews", self.body(review(), NO_FINDINGS + " See #12.")))
+        self.assertEqual(match["signal"], "actionable")
+
+    def test_change_request_with_no_findings_body_is_actionable(self):
+        match = self.evaluate(("reviews", self.body(review("CHANGES_REQUESTED"), NO_FINDINGS)))
+        self.assertEqual(match["signal"], "actionable")
+
+    def test_untouched_inline_comment_beside_no_findings_review_is_actionable(self):
+        match = self.evaluate(("reviews", self.body(review(submitted=21), NO_FINDINGS)),
+                              ("thread", comment(created=20)))
+        self.assertEqual(match["signal"], "actionable")
+        self.assertEqual([item["kind"] for item in match["untouched"]], ["inline", "COMMENTED"])
+
+    def test_feedback_answered_before_last_author_action_is_not_untouched(self):
+        match = self.evaluate(("comments", comment(created=20)), ("comments", comment("owner", 21)),
+                              ("reviews", self.body(review(submitted=22), NO_FINDINGS)))
+        self.assertEqual(match["signal"], "low")
+        self.assertEqual([item["date"] for item in match["untouched"]], [date(22)])
+
+    def test_feedback_body_is_trimmed(self):
+        match = self.evaluate(("comments", self.body(comment(), "x" * 2000)))
+        self.assertEqual(len(match["feedback"]["body"]), collector.BODY_LIMIT + 1)
+
+    def test_processing_order_is_priority_then_oldest_feedback(self):
+        def item(number, labels, day):
+            return {"number": number, "labels": labels, "feedback": {"date": date(day)}}
+        items = [item(1, [], 20), item(2, ["priority:low"], 10), item(3, ["priority:high"], 25),
+                 item(4, [], 15), item(5, ["Urgent Ticket"], 22)]
+        self.assertEqual([i["number"] for i in sorted(items, key=collector.processing_order)],
+                         [5, 3, 4, 1, 2])
+
+
 class ExplicitCollectionTests(unittest.TestCase):
-    def run_collection(self, urls, unavailable=None):
+    def run_collection(self, urls, unavailable=None, bodies=None, extra=()):
         unavailable = unavailable or {}
+        bodies = bodies or {}
 
         def graphql(query, variables=None):
             if "viewer { login }" in query:
@@ -148,13 +222,16 @@ class ExplicitCollectionTests(unittest.TestCase):
                 for node_id in variables["ids"]:
                     data = detail()
                     data["comments"] = [comment()]
+                    number = int(node_id.rsplit("_", 1)[1])
+                    if number in bodies:
+                        data["comments"][0]["body"] = bodies[number]
                     nodes.append({"id": node_id, **{
                         key: connection(data[key]) for key in collector.CONNECTIONS
                     }})
                 return {"nodes": nodes}
             raise AssertionError(f"Unexpected GraphQL call: {query}")
 
-        arguments = ["collect_feedback.py"]
+        arguments = ["collect_feedback.py", *extra]
         for url in urls:
             arguments.extend(["--pr", url])
         output = io.StringIO()
@@ -185,6 +262,42 @@ class ExplicitCollectionTests(unittest.TestCase):
         self.assertEqual(report["matches"], [])
         self.assertEqual(report["excluded"], [])
         self.assertEqual([item["url"] for item in report["unavailable"]], urls)
+
+    def test_low_signal_prs_are_split_unless_included(self):
+        urls = [pr(1)["url"], pr(2)["url"]]
+        code, report = self.run_collection(urls, bodies={2: "LGTM"})
+        self.assertEqual(code, 0)
+        self.assertEqual([item["number"] for item in report["matches"]], [1])
+        self.assertEqual([item["number"] for item in report["lowSignal"]], [2])
+        code, report = self.run_collection(urls, bodies={2: "LGTM"},
+                                           extra=["--include-low-signal"])
+        self.assertEqual([(item["number"], item["signal"]) for item in report["matches"]],
+                         [(1, "actionable"), (2, "low")])
+        self.assertEqual(report["lowSignal"], [])
+
+    def test_out_writes_report_and_prints_compact_lines(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "discovery.json"
+            arguments = ["collect_feedback.py", "--out", str(path), "--pr", pr(1)["url"]]
+
+            def graphql(query, variables=None):
+                if "viewer { login }" in query:
+                    return {"viewer": {"login": "owner"}}
+                if "number" in (variables or {}):
+                    return {"repository": {"pullRequest": pr(1)}}
+                data = detail()
+                data["comments"] = [comment()]
+                return {"nodes": [{"id": "PR_1", **{
+                    key: connection(data[key]) for key in collector.CONNECTIONS}}]}
+
+            output = io.StringIO()
+            with patch.object(collector, "graphql", side_effect=graphql), \
+                    patch.object(collector.sys, "argv", arguments), contextlib.redirect_stdout(output):
+                self.assertEqual(collector.main(), 0)
+            lines = output.getvalue().splitlines()
+            self.assertIn("matches=1", lines[0])
+            self.assertTrue(lines[1].startswith("matches\texample/repo#1\t"))
+            self.assertEqual(json.loads(path.read_text())["matches"][0]["number"], 1)
 
     def test_successful_collection_remains_complete(self):
         code, report = self.run_collection([pr()["url"]])
