@@ -1,68 +1,47 @@
 ---
 name: respond
-description: Analyze PR feedback in subagents and, when authorized, fix it in parallel, reply to reviewers, request their review again, and babysit CI. Use for PR comments, reviewer requests, or feedback plans.
+description: Analyze PR feedback in a delegated phase and, when authorized, fix it, publish replies, request reviewers and monitor CI. Use for PR comments, reviewer requests or feedback plans.
 ---
 
 # Respond to PR feedback
 
-Use the PR number supplied by the user, if any. Otherwise, find the PR for the current branch with `gh pr view`. If neither identifies a PR, ask for its number. Read the repository's agent instructions before examining code.
+A bare `/respond` or `$respond` requests a plan. Resolve the target from the supplied URL/number or current branch. Read target-repository instructions. Reuse the user's established authorization for code, commit/push, replies, reviewer requests, CI actions and thread resolution; explicit limits remain binding. A push, merge, approval and deployment are separate actions. Prepare excluded steps as drafts and continue permitted work.
 
-A bare `/respond` or `$respond` requests a plan only. Determine the authorized response workflow from the user's request and existing session instructions. When that authorization covers the full workflow, complete verified fixes, publication, original-comment replies, reviewer re-requests and babysitting without asking again. A request limited to code fixes does not itself authorize publication or reviewer-facing actions.
+## Phase ownership
 
-Establish which action categories are covered: code changes, commits/pushes, replies, reviewer requests, CI actions and thread resolution. A single workflow authorization can cover them together; reuse that scope assessment unless the user's instructions or task scope change, rather than adding per-action approval gates. Explicit code-only, local-only, no-commit, no-push or no-post limits remain binding; replies alone do not authorize code changes. Prepare excluded steps as drafts or a concrete handoff, report the blocked steps, and continue independent permitted work. Follow repository approval rules within the established scope.
+The parent schedules work, records compact ledger results, presents rendered plans and owns T3 linking/watching. Each child reads only its phase reference and applicable repository rules:
 
-## Roles
+- Read-only analyzer: [references/analyzer.md](references/analyzer.md), with [report schema](references/report-schema.md). It writes the analysis and coverage inventory.
+- One fixer per PR: [references/fixer.md](references/fixer.md). It implements approved rows and owns authorized push, replies and reviewer requests.
 
-The parent stays **lean**: it schedules children, records one line per result, presents rendered plans, runs `publish.py` for PRs without code changes, and owns T3 linking and watching. Substantive work happens in children, each running one phase from its reference and returning one line:
+Use native subagents for supported same-provider work and T3 `delegate_task` for isolation, other providers or requested settings. Follow the tool's orchestration/continuation instructions. A fixer needs an isolated checkout with one writer, assigned exact head and stable request ID. If delegation is unavailable, report that blocker. Delegation adds no authorization.
 
-- **Analyzer** (read-only): [references/analyzer.md](references/analyzer.md). Collects feedback, builds rows and draft replies, and writes `pr-NUMBER-analysis.json`.
-- **Fixer** (one per PR): [references/fixer.md](references/fixer.md). Applies approved rows, validates, commits, and when authorized pushes and publishes that PR's replies and reviewer requests. It is the PR's single publishing owner.
+A brief carries variables, not copied instructions: role/reference, PR URL/head/base, untouched or approved row IDs, run directory, exact authorization/limits, and resource slot. Use clean context when supported. Source, logs and full reports stay on disk; each result is one line with PR URL, head, outcome, artifact path and remaining objections.
 
-The parent reads child results through their one-line returns and rendered summaries. Reports, raw evidence and source code stay on disk. If no supported child mechanism is available, report the blocked phase; do not substitute parent analysis or implementation. Delegation preserves existing authorization; it does not expand it.
+## Artifacts and plans
 
-## Dispatch children
+Use `RUN_DIR/prs/OWNER/REPO/pr-NUMBER-*` for each PR's artifacts. Preserve repository identity even when PR numbers coincide. Write JSON artifacts directly; use the shared scripts for recurring transformations.
 
-Discover the live provider/model catalog through T3 `orchestrator_capabilities` when available. Use native subagents when they support the selected same-provider model; otherwise use T3 `delegate_task`. A fixer needs its own checkout: in T3 use `delegate_task` with `isolation:"worktree"` (it starts from the parent's committed state, so the brief names the exact PR head to check out); outside T3, use the supported workspace mechanism. Each checkout has one writer. Give each round a distinct `clientRequestId` that stays stable across retries, and pass prior evidence and unresolved objections by file path. All child work remains in the current user thread.
+Full rows cover untouched human feedback, other open human threads and actionable current bot findings. The coverage inventory accounts for history and author comments. An explicit exhaustive-table request gets an appendix on disk. Summary/context rows have `publish: false`. The current user's scope takes precedence over defaults; generic complete-coverage requirements do not imply repeated analysis or replies for history.
 
-Briefs carry variables and point at the phase reference; the reference carries the method:
+With a run ledger, render via `render_report.py --run-dir RUN_DIR`; for a single report, pass its path. Show only the printed summary and link the full report. Risk, Priority and other labels remain separate from each row's importance/value; refresh labels or label the timestamped snapshot. Displaying labels authorizes no label mutation.
 
-```text
-Role: analyzer. Follow ~/.codex/skills/respond/references/analyzer.md for exactly this PR.
-PR: URL  head: SHA  base: SHA
-Untouched feedback: URL, URL
-Run dir: RUN_DIR
-Authorization: analysis only.
-```
+## Complete the authorized workflow
 
-```text
-Role: fixer, round N. Follow ~/.codex/skills/respond/references/fixer.md.
-PR: URL  head: SHA  branch: HEAD_REF  head repository: OWNER/REPO
-Approved rows: RUN_DIR/pr-NUMBER-analysis.json ids ID, ID (other rows: replies only)
-Authorization: CATEGORIES ("user's words"); limits: LIMITS
-Run dir: RUN_DIR
-```
+- No code change: the parent runs `publish.py REPORT.json [...]` for the covered PRs together.
+- Code change: the fixer writes its publication plan with the original `humanFeedbackSnapshot`, pushes when authorized, runs the shared publisher and records the returned journal path.
+- The publisher blocks moved heads, new/edited human feedback and missing snapshots. Re-analyze stale feedback and revise drafts; preserve original raw evidence for safe legacy migration. Replay the same plan after an uncertain write, so hidden markers prevent duplicate replies.
+- Re-request original human reviewers whose feedback was addressed, change-request reviewers included. Preserve pending requests and skip reviewers already satisfied at the final head. Bot review stays separate from human approval.
+- The parent links each pushed PR immediately, watches it through supported T3 tools, and ends the turn while waiting. Follow returned notifications; batch settled CI failures and actionable feedback into one follow-up round. Repository CI policy governs validation. PRs with no push get no watcher. Stop all watches before final handback.
 
-For a single PR, use `~/.codex/review-runs/respond-NUMBER-<UTC timestamp>/` as the run directory. Independent feedback groups in one PR may get separate analyzers; tightly coupled fixes get one fixer.
+Resolve threads only when authorized and verified. Replies still accompany implemented fixes. This workflow alone does not authorize merging.
 
-## Present the plan
+## Progress and outcomes
 
-Render analyzer reports with `python3 ~/.codex/skills/respond/scripts/render_report.py REPORT.json [...]`. It prints the summary table and writes every per-comment table, plan and draft reply to a linked Markdown file. Show the summary table in chat and link the file. Refresh labels before presenting a plan or outcome; labels can change without a new commit. If a refresh fails, mark labels **Unavailable** or name the timestamped snapshot.
+Record phase/status, head, report/journal paths, focused verification, current-head CI, approval and blockers in the ledger in one update per wake-up. `ledger.py progress RUN_DIR` reports saved state without a network refresh. At phase transitions and when asked "Where are we?", show its compact counts, current PR/phase, blockers and next action. Include the run path and progress command in the first update. Status requests are read-only and preserve the active task.
 
-Label rules the renderer applies: **Risk** and **Priority** get their own columns beside the feedback and solution. JouleMV uses `risk:limited|disruptive|critical` (deployment consequence) and `priority:low|medium|high` (merge urgency). Other repositories keep labels verbatim, with legacy priority labels such as `high` or `Urgent Ticket` marked legacy. A missing label is **Not labeled**, never assumed low. Several labels in one category show as **Conflicting labels**. Remaining labels appear under **PR / other labels**, or `None`. Labels are observed metadata, separate from each comment's importance and value. Any proposed reassessment belongs in the plan, and displaying labels authorizes no label changes.
+Render outcomes with `render_report.py --run-dir RUN_DIR --outcomes`; it joins reports, publication journals and ledger status without bespoke outcome builders. Keep proposed fixes, verified publication, focused tests, CI, human/bot reviews, mergeability and deployment distinct. A terminal ledger label cannot hide remaining drafts or actions. End with exact heads, unresolved work and watch state.
 
-## Complete authorized fixes and follow through
+## Validate changes
 
-1. **No code change needed** (every row Answer, Defer or No change): run `publish.py` on the analysis report directly. It verifies the head, refuses stale plans, posts each reply once, re-requests reviewers and reads everything back. Several reports can go in one call.
-2. **Code change needed**: dispatch the PR's fixer with the approved rows and authorization. It pushes and publishes through `publish.py` itself.
-3. **Re-request the original human reviewers** whose feedback was addressed, change-request reviewers included, through GitHub review requests: never assignees, mentions or inferred code owners. `publish.py` preserves pending requests and skips reviewers who already reviewed the final head. Request review while CI runs; green CI is not a prerequisite. When a paused bot must review the new head, trigger its supported review command and keep bot review distinct from human approval.
-4. **Babysit pushed PRs** with [babysit-pr](../babysit-pr/SKILL.md) and current-head evidence. With T3 tools, `link_pull_request` and `watch_pull_request` each pushed PR, dispatch ready work, then end the turn: notifications wake the parent. PRs without a push have no new CI to watch. Route a CI failure or new feedback to a follow-up fixer round. Continue until required checks and actionable feedback are handled or an external blocker is concrete. Before handing back, `unwatch_pull_request` every watched PR. This workflow does not authorize merging.
-
-Resolve threads only within the user's authorization and after verification; a reply is still required when a fix is implemented.
-
-## Record outcomes
-
-Render outcomes with `render_report.py REPORT.json [...] --outcomes`. It joins every row with its `pr-NUMBER-publication.json` journal: posted reply URLs, drafts, and reviewer outcomes (**Requested**, **Already requested**, **Already reviewed final head**, **Blocked**). Every original comment has a disposition and an outcome. Keep proposed work separate from completed work; a pushed fix alone does not complete the workflow. The final report names the PR URL and published head, current-head CI, human and bot review states kept separate, merge/conflict state, active watches, and any human or external blocker.
-
-## Validate skill changes
-
-From `scripts/`: `python3 -B test_publish.py` and `python3 -B test_render_report.py`. Both run offline.
+Run the offline tests in `scripts/`: `test_publish.py` and `test_render_report.py`, plus relevant regression cases. They make no GitHub writes.
