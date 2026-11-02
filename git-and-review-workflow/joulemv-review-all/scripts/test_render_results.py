@@ -55,7 +55,7 @@ elements['report-data'].textContent=html.match(/<script id="report-data" type="a
 const document={getElementById:id=>elements[id],createElement:tag=>new Element(tag),documentElement:{scrollWidth:800}};
 const window={innerWidth:1000};
 vm.runInNewContext(html.match(/<script>\s*('use strict';.*?)<\/script>/s)[1],{document,window});
-function snapshot(){return {...window.reviewReportSelfCheck(),actions:elements.actions.textContent,overview:elements.overview.textContent,detail:elements['pr-detail'].textContent,scenarioDetail:elements.detail.textContent,selectionHeading:elements['selection-heading'].textContent,batchSummary:elements['batch-summary'].textContent,revisionWarning:elements['revision-warning'].textContent,prOptions:elements.pr.options.map(option=>({value:option.value,label:option.textContent})),projectOptions:elements.project.options.map(option=>({value:option.value,label:option.textContent})),prDisabled:!!elements.pr.disabled,scenarioDisabled:!!elements.scenario.disabled}}
+function snapshot(){return {...window.reviewReportSelfCheck(),selectedPRLink:(elements['selected-pr-link']?.children||[]).map(a=>({href:a.href||null,target:a.target,rel:a.rel,label:a.textContent})),actions:elements.actions.textContent,overview:elements.overview.textContent,detail:elements['pr-detail'].textContent,scenarioDetail:elements.detail.textContent,selectionHeading:elements['selection-heading'].textContent,batchSummary:elements['batch-summary'].textContent,revisionWarning:elements['revision-warning'].textContent,prOptions:elements.pr.options.map(option=>({value:option.value,label:option.textContent})),projectOptions:elements.project.options.map(option=>({value:option.value,label:option.textContent})),prDisabled:!!elements.pr.disabled,scenarioDisabled:!!elements.scenario.disabled}}
 const states=[snapshot()];
 for(const action of JSON.parse(process.argv[2])){elements[action.id].value=action.value;elements[action.id].listeners.change();states.push(snapshot())}
 process.stdout.write(JSON.stringify(states));
@@ -149,6 +149,28 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(joule["selectedPRIdentity"]["repository"], "EnerZam/JouleMV")
         self.assertEqual(batch["visiblePRCount"], 5)
         self.assertEqual(batch["selectedCounts"], initial["counts"])
+
+    def test_selected_pr_link_follows_every_pr_and_project_switch(self):
+        data = mixed_ledger()
+        # Reused numbers across repositories must follow the selected identity.
+        actions = [{"id": "pr", "value": str(i)} for i in range(len(data["prs"]))]
+        actions += [{"id": "project", "value": project["id"]} for project in self.prepare(data)["report"]["projects"]]
+        actions += [{"id": "project", "value": ""}]
+        for state in self.interact(data, actions):
+            pr = data["prs"][int(state["selectedPR"])]
+            self.assertEqual(state["selectedPRLink"], [{
+                "href": pr["url"], "target": "_blank", "rel": "noopener noreferrer",
+                "label": f"Open selected PR on GitHub · {pr['repository']} #{pr['number']} ↗",
+            }])
+            self.assertEqual(state["selectedPRUrl"], pr["url"])
+
+    def test_selected_pr_link_empty_batch_and_unsafe_url(self):
+        data = ledger()
+        data["prs"] = []
+        self.assertEqual(self.interact(data, [])[0]["selectedPRLink"], [])
+        data = ledger()
+        data["prs"][0]["url"] = "javascript:alert(1)"
+        self.assertIsNone(self.interact(data, [])[0]["selectedPRLink"][0]["href"])
 
     def test_selection_survives_project_filter_when_pr_still_visible(self):
         data = mixed_ledger()
