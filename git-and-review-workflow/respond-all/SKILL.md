@@ -1,91 +1,64 @@
 ---
 name: respond-all
-description: Find my open, unapproved PRs with untouched human feedback across all accessible GitHub repositories; delegate analysis and authorized fixes, then complete replies, reviewer requests and CI monitoring in the parent thread.
+description: Find open authored PRs with untouched human feedback, analyze a bounded batch and complete authorized fixes, replies and CI follow-through. Also report or resume an existing run's progress.
 ---
 
-# Respond to untouched human feedback across repositories
+# Respond to a batch of PR feedback
 
-Run the installed [respond skill](../respond/SKILL.md) for a batch of PRs from this conversation. Read it first: it defines the roles, briefs, authorization, plan rendering and follow-through used below. Also read the target repository's agent instructions and any repository-local `respond` skill or command; these supplement the shared contract. User instructions and repository policies retain precedence. `/respond-all` and `$respond-all` mean this same workflow.
+The parent uses [respond](../respond/SKILL.md) for authorization and phase ownership. Children use only their named phase reference and relevant repository rules. Target-repository safety, validation and explicit user scope remain binding.
 
-## Stay lean
+## Progress or continuation
 
-Every parent step re-sends the whole conversation, so this parent keeps its context small. Each wake-up is a few compact commands followed by a yield:
+A request such as `$respond-all status`, "Where are we?" or "Show progress" reads the existing run; it does not start discovery, authorize actions or resume a stopped watch:
 
-- Read state through `ledger.py summary` and child one-line returns. Reports, raw evidence, diffs and source stay on disk for children and renderers.
-- Record state with one `ledger.py apply` per wake-up, batching all of that wake-up's operations.
-- Publish through `publish.py` and render through `render_report.py`; write no per-PR scripts.
-- Give multi-PR commands `yield_time_ms` of at least 60000, or run them in the background. Never poll at second intervals.
-- When only asynchronous work remains, checkpoint and yield; notifications wake the parent.
+```bash
+python3 ~/.codex/skills/respond-all/scripts/ledger.py progress --latest
+# For a specific run:
+python3 ~/.codex/skills/respond-all/scripts/ledger.py progress RUN_DIR
+```
 
-Scripts live in `~/.codex/skills/respond-all/scripts/` (`collect_feedback.py`, `ledger.py`) and `~/.codex/skills/respond/scripts/` (`publish.py`, `render_report.py`). Resolve their absolute paths; do not assume the shell's directory.
+Report the saved timestamp, batch total, completed/active/waiting/blocked/queued/skipped counts, deferred and no-findings counts, current phase and next action. `--json` gives machine-readable details. The snapshot is recorded evidence, not a live GitHub check. If several runs could match the user's request, identify the intended run before changing it. For a resume, follow [checkpoint and resume](references/run-ledger.md).
 
-## Find the queue
+## Keep coordination bounded
 
-For a continuation, load the existing run with [Checkpoint and resume](references/run-ledger.md) and resume its unfinished entries. A new invocation starts a new run.
+Read `ledger.py progress` or `summary` and one-line child results. Full reports, source and raw logs stay in files for children/renderers. Limit parent reads to projected metadata and short summaries. Write JSON operations directly and batch them into one `ledger.py apply` per wake-up. Use publisher/renderer helpers for repeated work. At compaction, restore from the ledger rather than replaying full history.
 
-Discover with the authenticated GitHub identity across every repository its credentials can see; pass `--repo` only when the user restricts repositories (a JouleMV working directory is not a restriction):
+Use the execution tool's supported long-command yield and returned wait instruction. When only async work remains, checkpoint and yield. Inspect each notification once; stop watching concrete infrastructure-blocked PRs with an explicit handoff instead of repeatedly re-triaging the same external failure. New actionable feedback stays visible in the ledger.
+
+## Find and freeze the queue
+
+A new invocation creates a new run. Discover across every repository the authenticated account can see; a working directory is not a repository restriction:
 
 ```bash
 RUN_DIR=$(python3 ~/.codex/skills/respond-all/scripts/ledger.py init)
-python3 ~/.codex/skills/respond-all/scripts/collect_feedback.py --out "$RUN_DIR/discovery.json" [--repo OWNER/REPO ...]
+python3 ~/.codex/skills/respond-all/scripts/collect_feedback.py --out "$RUN_DIR/discovery.json"
+python3 ~/.codex/skills/respond-all/scripts/ledger.py queue "$RUN_DIR" --discovery "$RUN_DIR/discovery.json"
 ```
 
-The collector selects open PRs authored by the user, not approved, with human (non-bot) feedback that the author has not acted on since: no later reply, review, reviewer-request change, dismissal, ready-for-review, commit or force push. Feedback edits count as fresh feedback. It prints one line per PR and exits nonzero on partial collection: a failed collection is a coverage gap, never an empty queue. It sees only published GitHub activity, not local uncommitted work.
+The collector selects open, unapproved, authored PRs with untouched human feedback. Author actions can exclude unresolved feedback from fresh discovery; existing authorized run entries remain until reconciled. Use `--repo` only for a user restriction. Partial collection is a coverage gap, never an empty queue.
 
-It sorts PRs into two lists:
+Freeze 12 PRs by default (`queue --batch N` for explicit user size). Show account/scope, batch total, deferred count, low-signal PRs with links and gaps. Low-signal means a confidently benign no-findings item; ambiguous/mixed text stays actionable. `--include-low-signal` is an explicit override. Deferred PRs belong to a fresh thread's next batch. Provide the run path and progress command in this first update.
 
-- **matches**: at least one untouched item is a request, a question, a change request, an inline comment or a cross-PR reference. Ordered by priority label, then by the feedback that has waited longest.
-- **lowSignal**: every untouched item is a review body or comment that only reports no findings. Show these in one compact table with the feedback link and skip them. Add `--include-low-signal` only when the user asks to handle them.
+## Analyze and present one plan
 
-Freeze one batch, 12 PRs by default or the size the user asks for:
+Recheck the whole batch once with `collect_feedback.py --pr URL ... --include-low-signal --out RUN_DIR/recheck.json`; skip entries no longer eligible. Run at most four children, one fixer and one CPU-heavy local operation. Analyzers have no build/test slot. Record limits in the ledger and briefs.
 
-```bash
-python3 ~/.codex/skills/respond-all/scripts/ledger.py queue "$RUN_DIR" --discovery "$RUN_DIR/discovery.json" [--batch N]
-```
+Dispatch analyzer briefs pointing at `respond/references/analyzer.md`, the run directory, assigned exact head and `ledger.py show RUN_DIR PR_URL` for untouched feedback. Use the phase's compact row scope and coverage inventory. Each PR's artifacts live under `RUN_DIR/prs/OWNER/REPO/`; save the analysis path in its ledger entry. Record a result once and refill the available slot.
 
-Report the account, repository scope, batch, deferred count, low-signal list and coverage gaps. Identify PRs as `OWNER/REPO#number` everywhere; ledger entries are keyed by full URL. Deferred PRs belong to the next run, started in a new thread.
+When analyses finish, run `render_report.py --run-dir RUN_DIR`, show its summary and link the full plan. A bare invocation stops for one combined approval of the concrete plan; cite the instruction requiring it. Approval remains PR- and category-specific.
 
-## Analyze the batch
+## Execute and monitor
 
-Run at most **four children at once**, of which at most **one fixer**. The run has **one CPU-heavy slot** (builds, test runs, typechecks, installs, service startup): the active fixer holds it, and analyzers and the parent take none. Prefer remote CI for full suites; required local validation is serialized rather than skipped. Record these limits in the ledger and every brief. The user may set different limits.
+For authorized no-code PRs, the parent publishes their reports together. For code changes, queue one fixer per PR; it pushes and publishes. Immediately link each pushed PR, then watch through supported T3 tools. Follow delegate `next` instructions. End the turn while waiting for PR notifications.
 
-Before dispatching, re-check the whole batch in one call: `collect_feedback.py --pr URL --pr URL ... --include-low-signal --out "$RUN_DIR/recheck.json"`. Skip any PR that no longer qualifies. Then fill the slots with respond's analyzer brief, adding `Ledger: RUN_DIR` and replacing the untouched URLs with `Untouched feedback: ledger.py show RUN_DIR PR_URL (field untouched)`. When an analyzer returns, record its result and report path in one `apply`, then refill the slot. A PR whose code is inaccessible is blocked; other PRs continue.
+Handle each wake-up once: record returned results, refill slots, and checkpoint. Await settled CI before bundling failures and actionable comments into one follow-up. Bot walkthroughs alone do not require a fixer. A third fixer round becomes a blocked handoff to a separate `$respond PR_URL` task. Stop its watch; complexity must not hold the batch's only fixer slot.
 
-Analyzers record every original human reviewer in the ledger, change-request reviewers flagged with login, review ID/URL, reviewed head and comment IDs. Those reviewers are re-requested after their feedback is addressed, whatever GitHub's review state shows later.
-
-## Present one plan
-
-When the batch's analyses are done, render them all:
-
-```bash
-python3 ~/.codex/skills/respond/scripts/render_report.py "$RUN_DIR"/pr-*-analysis.json --out "$RUN_DIR/combined-plan.md"
-```
-
-Show the printed summary table and link `combined-plan.md`, which holds every per-comment table, plan and draft reply. A bare invocation authorizes analysis only: end with one combined request for the approvals respond and the repository require, naming and linking each instruction that requires approval.
-
-## Execute the authorized plan
-
-Apply respond's authorization contract per PR: permission for one PR does not cover another, and explicit limits stay binding. Advance each PR as soon as it is ready.
-
-- **No code change** (every row Answer, Defer or No change): publish all such PRs in one call, `publish.py RUN_DIR/pr-A-analysis.json RUN_DIR/pr-B-analysis.json ...`, and record each one-line outcome. These PRs get no watcher.
-- **Code change**: queue one fixer per PR (one at a time) with respond's fixer brief. The fixer pushes and publishes. When it returns a pushed head, `link_pull_request` and `watch_pull_request` that PR in the same step and record it.
-- **Stale** (`publish.py` exit 3, or a fixer returning `stale`): re-dispatch an analyzer for the new head before any further publication.
-
-## Handle notifications
-
-Handle each wake-up in one pass, then record and yield:
-
-- **Child finished**: record its line, refill the freed slot from ready work.
-- **CI still running, or only bot comments**: record and keep waiting. Bot comments are collected for the next round.
-- **CI settled with a failure, new human feedback, or bot comments collected**: queue one follow-up fixer round for that PR covering all of it (respond's fixer reference, "Follow-up rounds").
-- **CI green and nothing new**: record the PR as `done`, unwatch it.
-
-A PR that would need a **third fixer round** leaves the batch: mark it `blocked` with reason `handoff`, unwatch it, and recommend running `$respond PR_URL` in its own thread. Its complexity no longer holds the single fixer slot.
+After each phase transition, report compact progress with counts, current phase, blocker and next action. Keep publication completion separate from CI/approval. A terminal label preserves all outstanding drafts/actions.
 
 ## Finish
 
-Render outcomes with `render_report.py ... --outcomes --out "$RUN_DIR/combined-outcomes.md"` and show its summary table. Then give per-PR status: awaiting authorization, completed at an exact head, skipped after recheck, handed off, or blocked with the missing action. Keep posted replies, reviewer requests, code verification, CI and human approval distinct. List the deferred and low-signal PRs and suggest a new `$respond-all` thread for the next batch. Unwatch every watched PR before handing back. Approval, merging and deployment need their own authorization; updating this skill runs nothing.
+Use `render_report.py --run-dir RUN_DIR --outcomes`; ledger fields and referenced artifacts supply outcome evidence, so the parent need not rebuild per-PR reports. Show the summary and link the full result. Give exact heads, CI/review states, outstanding handoffs, deferred/no-findings lists and watch state. Unwatch every watched PR before final handback. Starting another batch or overriding 12 does not inherit the previous batch's authorization.
 
-## Validate skill changes
+## Validate changes
 
-From `scripts/`: `python3 -B test_collect_feedback.py` and `python3 -B test_ledger.py`. Both run offline. Respond's scripts have their own tests.
+Run offline `scripts/test_collect_feedback.py` and `scripts/test_ledger.py`, plus respond's script tests. Progress reads require no credentials, watcher or network calls.

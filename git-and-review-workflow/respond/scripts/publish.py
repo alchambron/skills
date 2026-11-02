@@ -5,19 +5,25 @@ Usage: publish.py PLAN.json [PLAN.json ...] [--dry-run] [--journal-dir DIR]
 
 A plan is either an analyzer report (comments with draftReply) or an explicit plan:
   {"url": PR_URL, "expectedHeadSha": SHA, "analyzedAt": ISO,
+   "humanFeedbackSnapshot": OBJECT_FROM_feedback_snapshot.py,
    "replies": [{"key": "4426046010", "kind": "inline", "inReplyTo": 4426046010, "body": "..."},
                {"key": "review-5700340832", "kind": "conversation", "body": "..."}],
    "reviewers": ["login"]}
 
 For each PR, in order: verify the PR is open at expectedHeadSha; stop as stale if a human
-posted after analyzedAt; post each reply once (a hidden marker makes reruns idempotent)
+posted or edited feedback after analysis, or the original feedback snapshot changed;
+post each reply once (a hidden marker makes reruns idempotent)
 and read it back; then request each reviewer unless already requested or already reviewed
 the final head, and read the request back. Every step is journaled before and after the
-write in pr-NUMBER-publication.json beside the plan. Exit 0 complete, 1 blocked, 3 stale.
+write in a repository-qualified journal. Missing snapshots require reconstruction from
+original complete raw evidence or fresh analysis. Retries preserve verified readbacks;
+revised plans archive their previous journal. --dry-run leaves journals unchanged.
+Exit 0 complete, 1 blocked, 3 stale.
 """
 
 import argparse
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -25,7 +31,9 @@ import re
 import subprocess
 import sys
 
-URL = re.compile(r"https://github\.com/([^/]+)/([^/]+)/pull/(\d+)/?")
+from feedback_snapshot import SnapshotError, build_snapshot
+
+URL = re.compile(r"https://github\.com/([A-Za-z0-9-]+)/([A-Za-z0-9_.-]+)/pull/([1-9]\d*)/?")
 KEY = re.compile(r"[A-Za-z0-9._:-]{1,100}")
 
 
@@ -35,6 +43,16 @@ class PublishError(Exception):
 
 def now():
     return datetime.now(timezone.utc).isoformat()
+
+
+def timestamp(value):
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            raise ValueError("timezone is required")
+        return parsed
+    except (AttributeError, TypeError, ValueError) as error:
+        raise PublishError(f"Invalid timestamp {value!r}: {error}") from None
 
 
 def gh(method, path, body=None, paginate=False):
@@ -57,16 +75,45 @@ def marker(key, analyzed_at):
     return f"<!-- respond-all {key} {analyzed_at} -->"
 
 
+def publication_journal_path(plan_path, url, journal_dir=None):
+    """Namespace journals by repository; accept a legacy file only for its PR."""
+    match = URL.fullmatch(url or "")
+    if not match or match.group(2) in (".", ".."):
+        raise PublishError("Journal identity must be a full GitHub PR URL")
+    owner, repo, number = match.groups()
+    parent = Path(journal_dir) if journal_dir else Path(plan_path).parent
+    namespaced = parent.parent.parent.name == "prs"
+    if namespaced:
+        if (parent.parent.name.casefold(), parent.name.casefold()) != (owner.casefold(), repo.casefold()):
+            raise PublishError("Plan/journal directory belongs to a different repository")
+        candidate = parent / f"pr-{number}-publication.json"
+    else:
+        candidate = parent / "prs" / owner.casefold() / repo.casefold() / f"pr-{number}-publication.json"
+    if candidate.exists():
+        if json.loads(candidate.read_text()).get("url") != url:
+            raise PublishError(f"Journal identity mismatch: {candidate}")
+        return candidate
+    legacy = parent / f"pr-{number}-publication.json"
+    if not namespaced and legacy.exists():
+        try:
+            if json.loads(legacy.read_text()).get("url") == url:
+                return legacy
+        except (OSError, ValueError, AttributeError):
+            pass
+    return candidate
+
+
 def load_plan(path):
     data = json.loads(Path(path).read_text())
     url = data.get("url")
     match = URL.fullmatch(url or "")
-    if not match:
+    if not match or match.group(2) in (".", ".."):
         raise PublishError(f"{path}: url must be a full GitHub PR URL")
     head = data.get("expectedHeadSha") or data.get("headSha")
     analyzed_at = data.get("analyzedAt")
     if not head or not analyzed_at:
         raise PublishError(f"{path}: expectedHeadSha/headSha and analyzedAt are required")
+    timestamp(analyzed_at)
     if "replies" in data:
         replies = data["replies"]
     else:
@@ -98,15 +145,33 @@ def load_plan(path):
     owner, repo, number = match.groups()
     return {"path": Path(path), "url": url, "repo": f"{owner}/{repo}", "number": int(number),
             "head": head, "analyzedAt": analyzed_at, "replies": replies,
+            "humanFeedbackSnapshot": data.get("humanFeedbackSnapshot"),
             "reviewers": list(dict.fromkeys(reviewers))}
 
 
 class Journal:
-    def __init__(self, path, plan):
+    def __init__(self, path, plan, readonly=False):
         self.path = path
+        self.readonly = readonly
         self.data = {"url": plan["url"], "expectedHeadSha": plan["head"],
                      "analyzedAt": plan["analyzedAt"], "plan": str(plan["path"]),
                      "startedAt": now(), "status": "running", "replies": {}, "reviewers": {}}
+        if path.exists():
+            raw = path.read_bytes()
+            previous = json.loads(raw)
+            if previous.get("url") != plan["url"]:
+                raise PublishError(f"Journal identity mismatch: {path}")
+            self.data["history"] = previous.get("history", [])
+            if (previous.get("expectedHeadSha"), previous.get("analyzedAt")) == (
+                    plan["head"], plan["analyzedAt"]):
+                # A stale/failed retry cannot undo already observed GitHub actions.
+                self.data["replies"] = previous.get("replies", {})
+                self.data["reviewers"] = previous.get("reviewers", {})
+            elif not readonly:
+                archive = path.with_name(f"{path.stem}.{hashlib.sha256(raw).hexdigest()[:16]}.json")
+                if not archive.exists():
+                    archive.write_bytes(raw)
+                self.data["history"] = [*self.data["history"], str(archive)]
 
     def record(self, section, key, **fields):
         self.data[section].setdefault(key, {}).update(fields, at=now())
@@ -117,23 +182,35 @@ class Journal:
         self.save()
 
     def save(self):
+        if self.readonly:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_suffix(".tmp")
         temporary.write_text(json.dumps(self.data, indent=1) + "\n")
         os.replace(temporary, self.path)
 
 
 def human_after(items, viewer, since, date_key):
+    cutoff = timestamp(since)
     return [item.get("html_url") for item in items
             if (item.get("user") or {}).get("type") == "User"
-            and item["user"]["login"] != viewer and (item.get(date_key) or "") > since]
+            and item["user"]["login"].casefold() != viewer.casefold()
+            and any(timestamp(value) > cutoff for value in (
+                item.get(date_key), item.get("updated_at")) if value)]
 
 
 def publish(plan, viewer, dry_run, journal_dir):
     repo, number, head = plan["repo"], plan["number"], plan["head"]
     base = f"repos/{repo}"
-    journal = Journal(Path(journal_dir or plan["path"].parent) / f"pr-{number}-publication.json", plan)
+    journal = Journal(publication_journal_path(plan["path"], plan["url"], journal_dir), plan,
+                      readonly=dry_run)
     lines = []
     tag = f"{repo}#{number}"
+
+    expected_snapshot = plan.get("humanFeedbackSnapshot")
+    if not isinstance(expected_snapshot, dict) or expected_snapshot.get("schemaVersion") != 1:
+        journal.finish("stale", reason="missing_feedback_snapshot")
+        return 3, [f"{tag}\tstale\tmissing humanFeedbackSnapshot; reconstruct from original analysis evidence"]
 
     pull = gh("GET", f"{base}/pulls/{number}")
     if pull["state"] != "open":
@@ -146,6 +223,14 @@ def publish(plan, viewer, dry_run, journal_dir):
     issue_comments = gh("GET", f"{base}/issues/{number}/comments?per_page=100", paginate=True)
     review_comments = gh("GET", f"{base}/pulls/{number}/comments?per_page=100", paginate=True)
     reviews = gh("GET", f"{base}/pulls/{number}/reviews?per_page=100", paginate=True)
+    try:
+        observed_snapshot = build_snapshot(plan["url"], viewer, issue_comments, review_comments, reviews)
+    except SnapshotError as error:
+        journal.finish("stale", reason="unverifiable_feedback", error=str(error))
+        return 3, [f"{tag}\tstale\tcannot verify human feedback: {error}"]
+    if expected_snapshot != observed_snapshot:
+        journal.finish("stale", reason="human_feedback_changed")
+        return 3, [f"{tag}\tstale\thuman feedback changed since analysis; re-analyze"]
     newer = (human_after(issue_comments, viewer, plan["analyzedAt"], "created_at")
              + human_after(review_comments, viewer, plan["analyzedAt"], "created_at")
              + human_after(reviews, viewer, plan["analyzedAt"], "submitted_at"))

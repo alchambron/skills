@@ -1,42 +1,45 @@
 # Checkpoint and resume
 
-The parent owns one ledger per run at `${CODEX_HOME:-$HOME/.codex}/review-runs/respond-all-<UTC timestamp>-<suffix>/ledger.json`, created by `ledger.py init`. Record the run directory's path in the conversation. Every artifact lives in that directory: discovery, analyzer reports, raw evidence, publish plans and publication journals. The ledger records their paths, never copies of their content; `ledger.py` rejects operations over 8 KB.
+The run ledger lives at `RUN_DIR/ledger.json`. Record the run path in the conversation. Raw evidence, reports and journals remain files; ledger entries hold paths and compact state. Use repository-qualified artifacts: `RUN_DIR/prs/OWNER/REPO/pr-NUMBER-*`. Existing flat runs retain their recorded paths.
 
-## Writing
-
-Change the ledger only through `ledger.py apply RUN_DIR`, which takes a JSON list of operations. One locked, fsynced, atomic write covers the whole list; an invalid operation leaves the previous ledger untouched. Children may record their own PR's entry the same way, and the lock serializes them with the parent.
+## Progress
 
 ```bash
-python3 ~/.codex/skills/respond-all/scripts/ledger.py apply "$RUN_DIR" <<'EOF'
-[{"pr": "https://github.com/O/R/pull/7", "set": {"phase": "fix", "status": "running", "child": {"taskId": "T", "requestId": "R"}}},
- {"pr": "https://github.com/O/R/pull/7", "report": {"analysis": "pr-7-analysis.json"}},
- {"pr": "https://github.com/O/R/pull/7", "reviewer": {"login": "alice", "reviewId": 5, "changeRequest": true, "reviewedHead": "SHA"}},
- {"run": {"executionAuthorizedAt": "2026-10-30T13:04:00Z", "authorizationEvidence": "Go for it execute the plan"}}]
-EOF
+python3 ~/.codex/skills/respond-all/scripts/ledger.py progress RUN_DIR
+python3 ~/.codex/skills/respond-all/scripts/ledger.py progress --latest
+# Structured snapshot for tooling:
+python3 ~/.codex/skills/respond-all/scripts/ledger.py progress RUN_DIR --json
 ```
 
-`ledger.py --help` lists the operations: `run`, `create`, `set`, `action`, `reviewer`, `comment`, `report` and `blocker`.
+The command is read-only and offline. It reports saved timestamps, exclusive state counts, active worker slots, deferred/no-findings counts, exact heads, current phases, blocker/next actions, and separate verification/publication/approval evidence. CI monitoring is waiting work, not an active child slot. Completed/skipped labels with outstanding actions or drafts remain unfinished. Missing historical evidence is reported as unrecorded, not inferred from a push.
 
-Write once per wake-up, before yielding, covering every child result, authorization change and phase transition of that wake-up. Publication intent and readback are journaled per action by `publish.py` in `pr-NUMBER-publication.json`; the ledger records the journal path and the PR's resulting status.
+A user may say `$respond-all status` or "Where are we?". Locate the run from the conversation (or use `--latest` when unambiguous) and summarize this command. A status request preserves the active task and existing authorization. It does not start a batch, replay publication or restore a watcher. When the user explicitly asks for a live refresh, record its timestamp and results separately from the saved snapshot.
 
-## Fields
+## Writes
 
-| Location | Fields |
-| --- | --- |
-| Run | `runId`, `schemaVersion`, `createdAt`, `updatedAt`, `scope`, `initialQueue`, `deferred`, `lowSignal`, `coverageGaps`, `resourceLimits`, `localOperationOwner`, `prs` |
-| PR | `repository`, `url`, `number`, `initialHeadSha`, `currentHeadSha`, `baseSha`, `labels`, `labelsCollectedAt`, `triggeringFeedback`, `untouched`, `reviewers`, `authorization`, `phase`, `status`, `child`, `reports`, `comments`, `actions`, `watcher`, `blockers`, `fixRounds` |
-| Reviewer | `login`, original review ID/URL/state, `reviewedHead`, comment IDs, `changeRequest`, addressed, final-head request outcome |
-| Authorization | Granted categories with the user's words as evidence, explicit limits, per-PR scope |
-| Child | Mechanism, task ID, request ID, phase, worktree, assigned head |
+Use `ledger.py apply RUN_DIR` with a JSON list on stdin. One lock and atomic write cover all operations; invalid operations leave the previous ledger intact. Batch each wake-up's phase/results into one call. Each operation is limited to 8 KB, so large evidence belongs in referenced files.
 
-Phases: `queued`, `analysis`, `fix`, `publish`, `respond`, `monitor`, `done`, `blocked`. Statuses: `queued`, `running`, `awaiting_authorization`, `blocked`, `completed`, `skipped`. Action statuses: `planned`, `in_flight`, `verified`, `blocked`. A terminal status keeps outstanding drafts and excluded actions visible. The ledger records authorization; it cannot grant it.
+```json
+[
+  {"pr": "https://github.com/O/R/pull/7", "set": {"phase": "fix", "status": "running", "child": {"taskId": "T", "requestId": "R"}}},
+  {"pr": "https://github.com/O/R/pull/7", "report": {"analysis": "prs/O/R/pr-7-analysis.json"}},
+  {"pr": "https://github.com/O/R/pull/7", "reviewer": {"login": "alice", "reviewId": 5, "changeRequest": true, "reviewedHead": "SHA"}},
+  {"run": {"executionAuthorizedAt": "ISO time", "authorizationEvidence": "user's words"}}
+]
+```
 
-## Resume
+The helper accepts `run`, `create`, `set`, `action`, `reviewer`, `comment`, `report` and `blocker` operations; `--help` gives syntax. The ledger records authorization but grants none.
 
-1. Locate the run named by the conversation or the user and run `ledger.py summary RUN_DIR`. If the run cannot be identified, ask which one. A missing or invalid ledger is reconstructed from the run directory's reports and journals before any external action.
-2. Re-check unfinished PRs in one call with `collect_feedback.py --pr URL ... --include-low-signal`, and refresh head, state, labels, review requests and checks. A push, reply or approval can drop a PR from fresh discovery without completing its authorized lifecycle; keep such entries until their outstanding actions are reconciled. A closed or merged PR gets an explicit recorded disposition.
-3. Re-run `publish.py` on any PR whose journal is not `complete`. Its markers and request checks make the replay idempotent: existing replies are recorded rather than duplicated, and pending or satisfied review requests are not re-sent. A pushed head that differs from the plan makes it stop as stale, and the PR returns to analysis.
-4. Reconcile existing child tasks through the supported mechanism before dispatching duplicates, keeping request IDs stable. Follow running T3 delegates' returned `next` instructions. Verify watcher state, and release a `localOperationOwner` whose task has ended.
-5. A PR interrupted after a verified push but before publication stays in `respond`: run `publish.py` on its plan right away. Queued or running CI does not block replies or review requests.
+For each completed fix, record the exact head, focused verification and per-row outcomes as compact `comment` updates. Record `verification`, `ci` (with head/timestamp), `publicationStatus`, `reviewDecision`/`humanApproval` with `approvalHeadSha`, and blockers separately. Each `reports.publication` value is the publisher's actual returned journal path. A verified publication does not mark CI or approval passed. These fields feed progress and `render_report.py --run-dir RUN_DIR --outcomes` directly.
 
-Ledgers from earlier runs (schema 1, without limits) are read with the current defaults, and their extra fields are preserved.
+Phases: `queued`, `analysis`, `fix`, `publish`, `respond`, `monitor`, `done`, `blocked`. Statuses: `queued`, `running`, `awaiting_authorization`, `blocked`, `completed`, `skipped`. Actions: `planned`, `in_flight`, `verified`, `blocked`. Preserve unfinished drafts/excluded actions at handoff.
+
+## Resume an authorized run
+
+1. Read progress and unfinished entries. Resolve missing/invalid ledgers from reports and journals before external actions. Use the supported task mechanism to reconcile existing children before dispatching duplicates; keep request IDs stable.
+2. Recheck unfinished PRs together (`collect_feedback.py --pr URL ... --include-low-signal`) and refresh heads, state, labels, checks and review requests. Fresh discovery can exclude a PR after the author pushed/replied; keep its unfinished authorized entry. Record closed/merged dispositions explicitly.
+3. For incomplete publication, replay the same plan through `publish.py`. Missing `humanFeedbackSnapshot` in a legacy plan is stale. Build it from the original complete REST evidence using `feedback_snapshot.py`; if that evidence is unavailable, re-analyze and revise drafts. Never bless old drafts with a snapshot of current feedback. New/edited human feedback or a moved head returns to analysis.
+4. A verified push followed by interrupted publication stays in `respond`; pending CI does not block authorized replies or reviewer requests. Keep T3 linking/watching with the parent and follow delegate `next` instructions.
+5. Record the result once, release completed resource owners and yield for outstanding async work. At final handoff, unwatch all watched PRs and leave blockers/drafts visible.
+
+Older ledger schemas are accepted with current defaults and preserved extra fields. Repository-qualified journals prevent collisions; a legacy flat journal is reused only when its recorded PR URL matches exactly. A stale retry preserves earlier verified reply/request readbacks. A revised plan archives the previous journal and records its path in `history`; `--dry-run` leaves journals unchanged.

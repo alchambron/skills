@@ -49,10 +49,21 @@ DETAIL = "id " + " ".join(
 # A COMMENTED review body or conversation comment that only reports "no findings"
 # needs no response work. Any question or request wording keeps it actionable.
 NO_FINDINGS = re.compile(
-    r"\bno (?:verified |distinct |blocking |remaining )?(?:actionable |new )?"
-    r"(?:findings?|issues?|defects?|concerns?|problems?|comments?)\b"
-    r"|\bno verified \w+ defect\b|\blgtm\b|\blooks good(?: to me)?\b",
-    re.IGNORECASE,
+    r"(?:no (?:verified |distinct |blocking |remaining )?(?:actionable |new )?"
+    r"(?:findings?|issues?|defects?|concerns?|problems?|comments?)"
+    r"(?: in this (?:test )?layer)?|lgtm|looks good(?: to me)?)", re.IGNORECASE,
+)
+# Skip only a complete, recognized no-findings statement and recognized scope /
+# execution disclaimers. Unknown prose remains actionable: a positive sentence
+# elsewhere in a review must never hide an observation or an imperative.
+BENIGN_SCOPE = re.compile(
+    r"(?:reviewed [^;.!?\n]+ against (?:the|its available) pr description"
+    r"(?: and (?:the )?(?:changed-file diff|dashboard query shape|pr diff))?"
+    r"|(?:this is a )?static review(?: of head [0-9a-f]{7,40})?"
+    r"|(?:the github workflow|tests|storybook and tests|tests and browser behavior)"
+    r" (?:was|were) not run(?: and runtime consumers are introduced in later layers)?"
+    r"|real http authorization and external-service behavior were not exercised"
+    r"|no threads existed on)", re.IGNORECASE,
 )
 # Questions, requests and cross-PR references ("the issue on #123 also affects...")
 # need analysis even inside a no-findings summary.
@@ -69,8 +80,11 @@ PRIORITY_RANK = {"priority:high": 0, "high": 0, "urgent ticket": 0,
 def is_low_signal(item, number=None):
     # A mention of the PR's own number is not a cross-PR reference.
     body = re.sub(rf"#{number}\b", "", item["body"]) if number else item["body"]
-    return item["kind"] in ("COMMENTED", "comment") and bool(
-        NO_FINDINGS.search(body)) and not REQUEST.search(body)
+    if item["kind"] not in ("COMMENTED", "comment") or REQUEST.search(body):
+        return False
+    clauses = [part.strip() for part in re.split(r"[.;\n]+", body) if part.strip()]
+    return bool(clauses) and any(NO_FINDINGS.fullmatch(part) for part in clauses) and all(
+        NO_FINDINGS.fullmatch(part) or BENIGN_SCOPE.fullmatch(part) for part in clauses)
 
 
 def excerpt(body):

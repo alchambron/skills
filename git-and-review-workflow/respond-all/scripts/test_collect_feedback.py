@@ -166,6 +166,25 @@ class SignalTests(unittest.TestCase):
                 match = self.evaluate(("reviews", self.body(review(), text)))
                 self.assertEqual(match["signal"], "actionable")
 
+    def test_mixed_positive_review_never_hides_observations_or_imperatives(self):
+        for text in (
+            "No findings in the backend. The frontend crashes when saving.",
+            "Looks good overall. The export endpoint leaks all tenants.",
+            "No actionable findings. Fix the broken keyboard navigation.",
+            "LGTM; Handle the null case.",
+            "No findings. Unexpected new prose is not a recognized disclaimer.",
+            "No findings. Reviewed export against the PR description and it leaks all tenants.",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.evaluate(("reviews", self.body(review(), text)))["signal"],
+                                 "actionable")
+
+    def test_recognized_static_scope_disclaimers_remain_low_signal(self):
+        text = ("Reviewed contract-cost normalization against the PR description and dashboard query shape; "
+                "no verified actionable findings. Static review of head " + "a" * 40 +
+                "; tests were not run.")
+        self.assertEqual(self.evaluate(("reviews", self.body(review(), text)))["signal"], "low")
+
     def test_own_pr_number_is_not_a_cross_reference(self):
         match = self.evaluate(("reviews", self.body(review(), NO_FINDINGS + " No threads existed on #1.")))
         self.assertEqual(match["signal"], "low")

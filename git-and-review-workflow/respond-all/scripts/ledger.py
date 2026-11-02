@@ -6,6 +6,7 @@ Commands:
   queue RUN_DIR --discovery FILE [--batch N] freeze the first N matches as the initial queue
   apply RUN_DIR [OPS_FILE|-]                apply a JSON list of operations in one atomic write
   summary RUN_DIR [--phase P] [--status S]  print slot usage and one line per PR
+  progress [RUN_DIR | --latest] [--json]    show recorded progress without changing the ledger
   show RUN_DIR PR_URL                       print one PR entry as JSON
 
 Operations (each names "run" or "pr"):
@@ -235,7 +236,7 @@ def label(entry):
 
 def summary(data, phase=None, status=None):
     prs = list(data["prs"].values())
-    running = [e for e in prs if e.get("status") == "running"]
+    running = [e for e in prs if e.get("status") == "running" and e.get("phase") != "monitor"]
     fixers = [e for e in running if e.get("phase") == "fix"]
     limits = data.get("resourceLimits", DEFAULT_LIMITS)
     counts = {}
@@ -266,6 +267,164 @@ def summary(data, phase=None, status=None):
     return "\n".join(lines)
 
 
+PROGRESS_STATES = ("completed", "running", "waiting_authorization", "waiting_ci",
+                   "queued", "blocked", "skipped")
+
+
+def outstanding(entry):
+    """Keep unfulfilled intent visible even when a parent marked the PR completed."""
+    actions = [a for a in entry.get("actions", []) if a.get("status") in
+               ("planned", "in_flight", "blocked", "draft")]
+    drafts = [c for c in entry.get("comments", [])
+              if c.get("publish") is not False and
+              (c.get("replyStatus") == "draft" or c.get("status") == "draft" or
+               c.get("replyOutcome") == "Draft" or
+               ((c.get("draftReply") or c.get("replyDraft")) and
+                not c.get("replyUrl") and not c.get("replyOutcome") and
+                c.get("replyStatus") not in ("verified", "posted")))]
+    return actions, drafts
+
+
+def progress(data, run_dir=None):
+    """Project only recorded ledger evidence; no API calls or inferred approvals."""
+    entries = []
+    counts = dict.fromkeys(PROGRESS_STATES, 0)
+    for url, original in data["prs"].items():
+        entry = {"url": url, **original}
+        phase, status = entry.get("phase", "queued"), entry.get("status", "queued")
+        actions, drafts = outstanding(entry)
+        blocked_actions = [a for a in actions if a.get("status") == "blocked"]
+        blockers = list(entry.get("blockers") or [])
+        if entry.get("handoffReason") and entry["handoffReason"] not in blockers:
+            blockers.append(entry["handoffReason"])
+        blockers += [a.get("condition") or a.get("outcome") or a.get("key", "Blocked action")
+                     for a in blocked_actions]
+        if status == "blocked" or phase == "blocked" or blockers:
+            state = "blocked"
+        elif status == "awaiting_authorization":
+            state = "waiting_authorization"
+        elif status == "skipped" and not actions and not drafts:
+            state = "skipped"
+        elif phase == "monitor":
+            state = "waiting_ci"
+        elif status == "running":
+            state = "running"
+        elif (status == "completed" or phase == "done") and not actions and not drafts:
+            state = "completed"
+        else:
+            state = "queued"
+        if blockers:
+            next_action = "Resolve blocker: " + str(blockers[0])
+        elif state == "waiting_authorization":
+            next_action = "Await approval of the response plan"
+        elif actions:
+            next_action = "Complete action: " + str(actions[0].get("key", "unnamed"))
+        elif drafts:
+            next_action = f"Publish or explicitly defer {len(drafts)} draft replies"
+        else:
+            next_action = {
+                "completed": "No recorded workflow action remains; approval and merge are separate",
+                "running": f"Await {phase} result",
+                "waiting_ci": "Await CI notification or resume monitoring if stopped",
+                "queued": f"Start {phase}",
+                "blocked": "Record the blocker and required next action",
+                "skipped": "No action in this batch",
+            }.get(state, "Refresh recorded state")
+        reports = entry.get("reports") or {}
+        if not isinstance(reports, dict):
+            reports = {"legacy": reports}
+        verification = entry.get("verification", entry.get("validation"))
+        if verification is None:
+            verification = {"status": "not summarized in ledger", "reports": {
+                k: v for k, v in reports.items()
+                if k.startswith("fixRound") or k in ("verification", "validation", "outcome")}}
+        publication = {
+            "pushedHeadSha": entry.get("publishedHeadSha"),
+            "journal": reports.get("publication"),
+            "status": entry.get("publicationStatus", "readback status not summarized in ledger"),
+        }
+        approval = {"reviewDecision": entry.get("reviewDecision", "not recorded"),
+                    "humanApproval": entry.get("humanApproval"),
+                    "headSha": entry.get("approvalHeadSha")}
+        ci = entry.get("ci", entry.get("checks", {"status": "not recorded"}))
+        row = {"url": entry["url"], "label": label(entry), "state": state,
+               "phase": phase, "status": status, "fixRounds": entry.get("fixRounds", 0),
+               "headSha": entry.get("currentHeadSha") or entry.get("publishedHeadSha") or
+                          entry.get("initialHeadSha"),
+               "nextAction": next_action, "blockers": blockers,
+               "outstandingActions": actions, "draftReplies": len(drafts),
+               "verification": verification, "publication": publication, "ci": ci,
+               "approval": approval}
+        entries.append(row)
+        counts[state] += 1
+    active = [e for e in entries if e["status"] == "running" and e["phase"] != "monitor"]
+    return {"runId": data.get("runId"), "runDir": str(run_dir) if run_dir else None,
+            "updatedAt": data.get("updatedAt") or data.get("createdAt"),
+            "source": "Recorded ledger snapshot; no live GitHub refresh",
+            "batchTotal": len(entries), "counts": counts,
+            "deferred": len(data.get("deferred") or []),
+            "lowSignalSkipped": len(data.get("lowSignal") or []),
+            "activeChildren": len(active),
+            "activeFixers": sum(e["phase"] == "fix" for e in active),
+            "coverageGaps": data.get("coverageGaps") or [], "entries": entries}
+
+
+def progress_text(snapshot):
+    counts = " ".join(f"{k}={v}" for k, v in snapshot["counts"].items())
+    lines = [f"{snapshot['runId']} updated={snapshot['updatedAt'] or 'unknown'} (recorded only)",
+             f"batch={snapshot['batchTotal']} {counts}",
+             f"children={snapshot['activeChildren']} fixers={snapshot['activeFixers']} "
+             f"deferred={snapshot['deferred']} no-findings-skipped={snapshot['lowSignalSkipped']} "
+             f"coverage-gaps={len(snapshot['coverageGaps'])}"]
+    for row in snapshot["entries"]:
+        pub = row["publication"]
+        verification = row["verification"]
+        verification_status = (verification.get("status", "details recorded")
+                               if isinstance(verification, dict) else "details recorded")
+        if isinstance(verification, dict) and verification.get("reports"):
+            verification_status = "see recorded reports"
+        publication_status = "pushed" if pub["pushedHeadSha"] else "push not recorded"
+        if pub["journal"]:
+            publication_status += ", journal recorded"
+        if pub["status"] != "readback status not summarized in ledger":
+            publication_status += ", " + str(pub["status"])
+        ci = row["ci"]
+        ci_status = (ci.get("status", ci.get("state", "details recorded"))
+                     if isinstance(ci, dict) else str(ci))
+        approval = row["approval"]["reviewDecision"]
+        if row["approval"]["humanApproval"] is not None:
+            approval += f", humanApproval={row['approval']['humanApproval']}"
+        lines.append(f"{row['label']} {row['state']} phase={row['phase']} rounds={row['fixRounds']} "
+                     f"head={row['headSha'] or '-'}; next={row['nextAction']}" +
+                     (f"; outstanding={len(row['outstandingActions'])} drafts={row['draftReplies']}"
+                      if row['outstandingActions'] or row['draftReplies'] else "") +
+                     f"; verification={verification_status}; CI={ci_status}; publication={publication_status}; "
+                     f"approval={approval}")
+        if len(row["blockers"]) > 1:
+            lines.append("  additional blockers=" + "; ".join(str(b) for b in row["blockers"][1:]))
+    return "\n".join(lines)
+
+
+def latest_run(root=None):
+    root = Path(root or Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")) / "review-runs")
+    candidates = []
+    for path in root.glob("respond-all-*/ledger.json"):
+        try:
+            data = read(path.parent)
+            if not isinstance(data.get("prs"), dict):
+                continue
+            stamp = data.get("updatedAt") or data.get("createdAt")
+            updated = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+            if updated.tzinfo is None:
+                updated = updated.replace(tzinfo=timezone.utc)
+            candidates.append((updated, str(path.parent), path.parent))
+        except (LedgerError, OSError, ValueError, TypeError, AttributeError):
+            continue
+    if not candidates:
+        raise LedgerError(f"No readable respond-all ledger with a timestamp under {root}")
+    return max(candidates)[2]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -285,6 +444,11 @@ def main():
     p = sub.add_parser("show")
     p.add_argument("run_dir")
     p.add_argument("url")
+    p = sub.add_parser("progress")
+    p.add_argument("run_dir", nargs="?")
+    p.add_argument("--latest", action="store_true")
+    p.add_argument("--root", help="Run directory parent used with --latest")
+    p.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
     if args.command == "init":
@@ -302,6 +466,12 @@ def main():
         if entry is None:
             raise LedgerError(f"Unknown PR {args.url}")
         print(json.dumps(entry, indent=1))
+    elif args.command == "progress":
+        if bool(args.run_dir) == args.latest or args.root and not args.latest:
+            raise LedgerError("Use progress RUN_DIR or progress --latest [--root DIR]")
+        run_dir = latest_run(args.root) if args.latest else Path(args.run_dir)
+        snapshot = progress(read(run_dir), run_dir)
+        print(json.dumps(snapshot, indent=1) if args.json else progress_text(snapshot))
     return 0
 
 
