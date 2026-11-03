@@ -51,6 +51,19 @@ Copy each downloaded export into the run evidence directory immediately, before 
 
 Use unique scenario IDs; distinguish variants and keep retried attempts under one final outcome. Mark a scenario `pass` only when its required behavior and variants were exercised with supporting evidence. Use `partial` for exercised subcases with unverified required steps, `blocked` for unexecuted checks with a concrete dependency, `observed` when behavior lacks an acceptance judgment, and `spec_gap` when a missing requirement prevents that judgment. A reproduced acceptance defect is `fail`, even when other checks remain. Keep convention observations, preexisting behavior and environmental blockers distinct from verified new defects. Report review outcomes and acceptance counts separately; completed static reviews never imply finished runtime coverage.
 
+## Classify failed scenarios
+
+A scenario's `fail` result records unmet acceptance behavior; the publication decision requires a separate, explicit judgment. For each failure, compare the pinned base/head and the PR's requirements, reproduce or trace the trigger and consequence, and record the classification and supporting evidence in the scenario's existing `actual` field. Resolve each failure as one of these:
+
+- **Verified actionable PR defect:** the change introduces the failure or breaks a behavior promised by the PR. Publish it, or link equivalent existing feedback after checking its content and revision relevance.
+- **Inherited behavior outside the PR contract:** show that the failure predates the change and that the PR neither newly exposes it nor promises to correct the affected behavior. Explain why no new review is required.
+- **Environment failure:** identify the prerequisite and affected checks, retain the evidence, and follow the unblocking loop. Environment failure alone is not a product finding.
+- **Unresolved attribution or requirement:** state the missing comparison, reproduction or spec evidence and pursue it. Keep publication disposition pending until resolved or explicitly deferred by the user; do not conclude `not_required` from uncertainty.
+
+An inherited helper or rendering bug can still violate a newly introduced flow or export contract. Its age alone is insufficient reason to dismiss it: check whether the changed caller or promised behavior now depends on it. For example, when a PR promises exports that match displayed month names, verify a language change with the grid still open; stale cells and newly localized exports require validation against that promise even if cell memoization predates the patch.
+
+Preserve the failed acceptance result when deciding that no new blocking review is warranted; record the reason separately. For each failed scenario, reconcile the final disposition with the PR's `review` and `publication` records and the user-facing summary. A PR can have no verified new review finding and still have failed acceptance checks; explain both outcomes explicitly.
+
 ## Cleanup and failure handling
 
 After any start attempt, run the target profile's cleanup in a finally-style path. JouleMV uses the same helper's `stop` from the owned worktree; WebSynco uses its recorded owned backend/frontend processes, database and checkouts. Verify the owned database was dropped and server processes stopped; inspect `status` or ownership-checked process/database evidence if the receipt is ambiguous. An `already_stopped` result is sufficient only when owned resources are confirmed absent. Cleanup receipts pin the database endpoint and process ownership from startup. If ownership cannot be verified, retain the receipt and report cleanup pending; do not reconstruct ownership from a changed environment file. Legacy receipts without an endpoint require manual ownership verification before cleanup. Never stop another thread's runtime or drop a source/shared database.
