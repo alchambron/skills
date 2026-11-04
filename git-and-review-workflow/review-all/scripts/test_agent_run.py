@@ -510,6 +510,21 @@ class RuntimeTests(unittest.TestCase):
             with self.assertRaisesRegex(agent_run.LaunchError, "unavailable"):
                 agent_run.choose_port(5200, "5200")
 
+    def test_vite_wrapper_accepts_function_configs(self):
+        config = agent_run.prepare_vite("c" * 32)
+        self.addCleanup(agent_run.cleanup_vite, "c" * 32)
+        self.assertIn("typeof baseConfig === 'function' ? await baseConfig(env)", config.read_text())
+
+    def test_frontend_calls_api_on_vite_origin_only_when_worktree_proxies(self):
+        backend = "http://127.0.0.1:8090"
+        config = agent_run.ROOT / "frontend" / "vite.config.ts"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text("export default {};\n")
+        self.assertEqual(agent_run.frontend_api_env(backend)["VITE_API_URL"], backend)
+        config.write_text("const target = env.VITE_DEV_API_UPSTREAM;\n")
+        self.assertEqual(agent_run.frontend_api_env(backend),
+                         {"VITE_API_URL": "/", "VITE_LEGACY_API_URL": "/", "VITE_DEV_API_UPSTREAM": backend})
+
     def test_vite_cache_is_private_to_each_run_and_removed(self):
         first, second = "a" * 32, "b" * 32
         first_config = agent_run.prepare_vite(first)

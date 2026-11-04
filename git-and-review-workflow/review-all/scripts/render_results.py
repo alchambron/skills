@@ -136,13 +136,21 @@ def live_evidence_gaps(pr):
     if scope not in ("pr-head-only", "integration", "technical"):
         gaps.append("Test scope is not recorded as pr-head-only, integration, or technical")
     commit = live.get("runtime_commit")
+    heads = {str(pr.get("head_sha", "")).lower()}
+    pin_sets = [{str(pr.get(key, "")).lower() for key in ("base_sha", "head_sha")}]
+    # Carry mode: the head only added documentation, so evidence from the code-identical head still applies.
+    carried = live.get("carried_from") if (pr.get("review_basis") or {}).get("mode") == "carry" else None
+    if isinstance(carried, dict) and full_sha(carried.get("head_sha")):
+        heads.add(carried["head_sha"].lower())
+        if full_sha(carried.get("base_sha")):
+            pin_sets.append({carried["base_sha"].lower(), carried["head_sha"].lower()})
     if not full_sha(commit):
         gaps.append("Tested runtime/source commit is unavailable")
-    elif scope in ("pr-head-only", "technical") and commit.lower() != str(pr.get("head_sha", "")).lower():
+    elif scope in ("pr-head-only", "technical") and commit.lower() not in heads:
         gaps.append("Tested runtime/source commit differs from the pinned head")
     if scope == "integration":
         parents = live.get("integration_parents")
-        if not isinstance(parents, list) or len(parents) != 2 or not all(full_sha(parent) for parent in parents) or {parent.lower() for parent in parents} != {str(pr.get(key, "")).lower() for key in ("base_sha", "head_sha")}:
+        if not isinstance(parents, list) or len(parents) != 2 or not all(full_sha(parent) for parent in parents) or {parent.lower() for parent in parents} not in pin_sets:
             gaps.append("Integration commit parents do not match the pinned base and head")
     environment = live.get("environment")
     if not ((isinstance(environment, str) and environment.strip()) or (isinstance(environment, dict) and environment)):

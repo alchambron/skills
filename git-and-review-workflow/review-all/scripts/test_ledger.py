@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import patch
 
 from collect_reviews import CollectionError
-from ledger import initialize, record, resume, save
+from ledger import carry, initialize, record, resume, save
 from test_render_results import ledger, scenario
 
 
@@ -259,6 +259,58 @@ class LedgerTests(unittest.TestCase):
         result = resume(self.path, api)["prs"][0]
         self.assertEqual(api.calls, [])
         self.assertIn("host", result["resume_error"])
+
+
+
+class CarryTests(unittest.TestCase):
+    """A head that only added documentation inherits the earlier run's outcome for the same code."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        earlier = ledger()
+        pr = earlier["prs"][0]
+        pr["review"] = {"status": "issues", "findings": [{"title": "Stale row"}], "standards": [], "spec": [], "limits": []}
+        pr["publication"] = {"status": "reused", "reused_threads": ["https://github.com/Example/Application/pull/7#discussion_r1"]}
+        pr["scenarios"] = [scenario("STALE", "fail"), scenario("LABELS", "partial")]
+        pr["coverage_gaps"] = ["Spanish fixtures seeded in owned clone"]
+        (self.root / "earlier").mkdir()
+        save(self.root / "earlier" / "results.json", earlier)
+        current = ledger()
+        item = current["prs"][0]
+        item.update(head_sha="c" * 40, review_basis={"mode": "carry", "fromHead": "b" * 40, "fromBase": "a" * 40,
+                                                    "previousRun": str(self.root / "earlier"),
+                                                    "changedFiles": ["docs/feature-map/index.json"]})
+        for key in ("current_base_sha", "current_head_sha"):
+            item.pop(key)
+        item["review"] = {"status": "pending", "findings": [], "standards": [], "spec": [], "limits": []}
+        item["publication"], item["live"], item["scenarios"] = {"status": "pending"}, {"status": "pending"}, []
+        self.path = self.root / "results.json"
+        save(self.path, current)
+
+    def test_carry_copies_review_scenarios_and_live_and_reopens_publication(self):
+        result = carry(self.path)
+        self.assertEqual(result["carried"], [{"pr": "Example/Application#7", "review": "issues", "publication": "pending",
+                                              "live": "complete", "scenarios": 2}])
+        pr = json.loads(self.path.read_text())["prs"][0]
+        self.assertEqual(pr["head_sha"], "c" * 40)
+        self.assertEqual([s["status"] for s in pr["scenarios"]], ["fail", "partial"])
+        self.assertEqual(pr["scenarios"][0]["carried_from"]["head_sha"], "b" * 40)
+        self.assertEqual(pr["live"]["carried_from"]["changed_files"], ["docs/feature-map/index.json"])
+        self.assertEqual(pr["publication"]["carried_from"]["status"], "reused")
+        self.assertIn("Spanish fixtures seeded in owned clone", pr["coverage_gaps"])
+        self.assertTrue(pr["review"]["limits"][-1].startswith("Carried from"))
+        self.assertEqual(carry(self.path)["skipped"][0]["reason"], "stages already recorded in this run")
+
+    def test_carry_skips_when_earlier_run_lacks_that_head(self):
+        data = json.loads(self.path.read_text())
+        data["prs"][0]["review_basis"]["fromHead"] = "d" * 40
+        save(self.path, data)
+        result = carry(self.path)
+        self.assertEqual(result["carried"], [])
+        self.assertIn("no finished review", result["skipped"][0]["reason"])
+        self.assertEqual(json.loads(self.path.read_text())["prs"][0]["review"]["status"], "pending")
 
 
 if __name__ == "__main__":

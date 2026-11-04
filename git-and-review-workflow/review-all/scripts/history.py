@@ -27,6 +27,10 @@ DONE_REVIEW = {"clean", "issues"}
 DONE_PUBLICATION = {"verified", "reused", "not_required", "not_requested"}
 DONE_LIVE = {"complete", "not_required"}
 PRIORITY = {"moved": 0, "rerequested": 0, "retry": 1, "new": 2}
+# A moved head whose new commits touch only these paths runs the code already reviewed and tested.
+DOC_SUFFIXES = (".md", ".mdx", ".rst", ".adoc")
+RUNTIME_DIRS = {"src", "public", "static", "assets", "resources", "templates"}
+COMPARE_FILE_LIMIT = 300
 
 
 def stamp():
@@ -86,6 +90,46 @@ def classify(entry, head, force):
     return "retry", {"mode": "retry", "previousOutcome": entry.get("outcome"), "previousRun": entry.get("runDir")}
 
 
+def documentation_only(paths):
+    """True when every path is documentation that no build or runtime reads."""
+    def documentation(path):
+        parts = path.split("/")
+        if parts[0] == "docs":
+            return True
+        return path.lower().endswith(DOC_SUFFIXES) and not RUNTIME_DIRS.intersection(parts[:-1])
+    return bool(paths) and all(documentation(path) for path in paths)
+
+
+def changed_paths(api, name, from_head, head):
+    """Files changed from from_head to head, or None when head does not simply extend from_head."""
+    value = api.get(f"repos/{name}/compare/{from_head}...{head}")
+    if not isinstance(value, dict) or value.get("status") != "ahead":
+        return None
+    files = value.get("files")
+    if not isinstance(files, list) or len(files) >= COMPARE_FILE_LIMIT:
+        return None
+    paths = []
+    for item in files:
+        paths.append(item["filename"])
+        if item.get("previous_filename"):
+            paths.append(item["previous_filename"])
+    return paths
+
+
+def carry_basis(api, name, entry, head, basis, warnings):
+    """Turn an incremental basis into carry when the new commits change only documentation."""
+    if not entry.get("complete"):
+        return basis
+    try:
+        paths = changed_paths(api, name, basis["fromHead"], head)
+    except (CollectionError, KeyError, TypeError, ValueError) as exc:
+        warnings.append(f"{name}: compare {basis['fromHead'][:12]}...{head[:12]} unavailable ({exc}); reviewing incrementally")
+        return basis
+    if paths is None or not documentation_only(paths):
+        return basis
+    return {**basis, "mode": "carry", "changedFiles": paths}
+
+
 def select(api, state, repositories, force, scratch):
     identity = api.get("user")
     login = identity.get("login") if isinstance(identity, dict) else None
@@ -112,10 +156,13 @@ def select(api, state, repositories, force, scratch):
         if pr.get("draft"):
             skipped.append({**item, "reason": "draft"})
             continue
-        kind, basis = classify(state["prs"].get(item["key"]), head, force)
+        entry = state["prs"].get(item["key"])
+        kind, basis = classify(entry, head, force)
         if basis is None:
             skipped.append({**item, "reason": kind})
             continue
+        if kind == "moved":
+            basis = carry_basis(api, name, entry, head, basis, warnings)
         candidates.append({**item, "kind": kind, "basis": basis})
     seen = {c["key"] for c in candidates} | {s["key"] for s in skipped}
     # Publishing Request changes clears the request, so an unfinished live test is resumed from history.

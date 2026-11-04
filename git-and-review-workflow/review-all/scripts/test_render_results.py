@@ -381,6 +381,17 @@ class ReportTests(unittest.TestCase):
         data["prs"][0]["live"]["integration_parents"] = ["a" * 40, "b" * 40]
         self.assertEqual(self.prepare(data)["report"]["current_counts"]["pass"], 1)
 
+    def test_carried_evidence_from_code_identical_head_counts_only_in_carry_mode(self):
+        data = ledger()
+        pr = data["prs"][0]
+        pr.update(head_sha="c" * 40, current_head_sha="c" * 40)
+        pr["live"]["carried_from"] = {"run": "/runs/earlier", "head_sha": "b" * 40, "base_sha": "a" * 40}
+        self.assertEqual(self.prepare(data)["report"]["current_counts"]["pass"], 0)
+        pr["review_basis"] = {"mode": "carry", "fromHead": "b" * 40}
+        self.assertEqual(self.prepare(data)["report"]["current_counts"]["pass"], 1)
+        pr["live"].update(scope="integration", integration_parents=["a" * 40, "b" * 40])
+        self.assertEqual(self.prepare(data)["report"]["current_counts"]["pass"], 1)
+
     def test_complete_requires_executed_acceptance_scenarios(self):
         for scenarios in ([], [scenario(status="blocked")], [scenario(status="observed")], [scenario(status="partial")], [scenario(status="spec_gap")]):
             data = ledger()
