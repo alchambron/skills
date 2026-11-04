@@ -330,13 +330,29 @@ def collect_pr(api, hit, login, output):
     return record, True
 
 
-def collect(api, output, repositories=()):
+def selection_hits(selection, host):
+    """Turn history.py selected PRs into search-shaped hits plus their review basis."""
+    hits, basis = [], {}
+    for item in selection.get("selected", []):
+        repository_parts(item["repository"])
+        number = int(item["number"])
+        api_root = "https://api.github.com" if host == "github.com" else f"https://{host}/api/v3"
+        url = item.get("url") or f"https://{host}/{item['repository']}/pull/{number}"
+        hits.append({"html_url": url, "title": item.get("title") or "",
+                     "pull_request": {"url": f"{api_root}/repos/{item['repository']}/pulls/{number}"}})
+        basis[(item["repository"], number)] = {**item.get("basis", {}), "kind": item.get("kind")}
+    return hits, basis
+
+
+def collect(api, output, repositories=(), selection=None):
     output = Path(output).expanduser().resolve()
     output.mkdir(parents=True, exist_ok=False)
+    scope = ("history selection: direct review requests not yet reviewed at their current head" if selection is not None
+             else "current direct review requests; team-only requests excluded")
     snapshot = {"version": 1, "login": None, "host": api.host,
                 "collected_at": dt.datetime.now(dt.timezone.utc).isoformat(), "prs": [], "excluded": [],
                 "collection": {"complete": False, "warnings": [], "queries": [],
-                               "scope": "current direct review requests; team-only requests excluded", "repositories": list(repositories)}}
+                               "scope": scope, "repositories": list(repositories)}}
     target = output / "snapshot.json"
     try:
         identity = api.get("user")
@@ -344,14 +360,21 @@ def collect(api, output, repositories=()):
         if not isinstance(login, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", login):
             raise CollectionError("Authenticated GitHub login unavailable")
         snapshot["login"] = login
-        hits, queries, search_complete = search_requests(api, login, repositories, output)
-        snapshot["collection"]["queries"] = queries
-        for query in queries:
-            snapshot["collection"]["warnings"].extend(query["warnings"])
+        basis = {}
+        if selection is not None:
+            hits, basis = selection_hits(selection, api.host)
+            search_complete = True
+        else:
+            hits, queries, search_complete = search_requests(api, login, repositories, output)
+            snapshot["collection"]["queries"] = queries
+            for query in queries:
+                snapshot["collection"]["warnings"].extend(query["warnings"])
         save_json(target, snapshot)
         for hit in hits:
             try:
                 record, included = collect_pr(api, hit, login, output)
+                if (record.get("repository"), record.get("number")) in basis:
+                    record["review_basis"] = basis[(record["repository"], record["number"])]
                 snapshot["prs" if included else "excluded"].append(record)
             except CollectionError as exc:
                 snapshot["prs"].append({"url": hit.get("html_url"), "title": hit.get("title"),
@@ -370,13 +393,15 @@ def main(argv=None):
     parser.add_argument("--output", required=True, help="New run directory (existing directories are refused)")
     parser.add_argument("--repo", action="append", default=[], help="Optional owner/name scope; repeat for several repositories")
     parser.add_argument("--host", default="github.com")
+    parser.add_argument("--selection", type=Path, help="history.py selection file; collect only its selected PRs")
     args = parser.parse_args(argv)
     try:
         for repository in args.repo:
             repository_parts(repository)
         api = GitHub(args.host)
-        snapshot, target = collect(api, args.output, list(dict.fromkeys(args.repo)))
-    except (CollectionError, FileExistsError, OSError) as exc:
+        selection = json.loads(args.selection.read_text(encoding="utf-8")) if args.selection else None
+        snapshot, target = collect(api, args.output, list(dict.fromkeys(args.repo)), selection)
+    except (CollectionError, FileExistsError, OSError, ValueError, KeyError) as exc:
         print(json.dumps({"error": str(exc)}), file=sys.stderr)
         return 2
     print(json.dumps({"snapshot": str(target), "login": snapshot["login"], "prs": len(snapshot["prs"]),

@@ -92,7 +92,7 @@ def initialize(snapshot_path, output):
             pr["repository"], pr["number"] = match[1], int(match[2])
         repository_parts(pr["repository"])
         pr["title"] = pr["title"] or "Unavailable PR title"
-        for key in ("project_type", "project_label", "runtime_provenance"):
+        for key in ("project_type", "project_label", "runtime_provenance", "review_basis"):
             if key in candidate:
                 pr[key] = copy.deepcopy(candidate[key])
         pr["coverage_gaps"] = list(candidate.get("coverage", {}).get("warnings", []))

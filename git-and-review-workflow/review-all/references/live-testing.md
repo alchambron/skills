@@ -6,14 +6,19 @@ Read before preparing a runtime for the PR's planned acceptance scenarios. Use t
 
 The default is a detached disposable worktree at the exact reviewed PR head, outside the user's checkout. Label all evidence `pr-head-only`. When the user asks for integration testing, build an isolated merge of the pinned base and head; verify both parents. Abort conflicts and report the integration limit rather than resolving them as part of review. A live deployed site is relevant only when its exact revision is verified and its mutation scope is authorized.
 
-Use one bounded runtime per PR; run memory-heavy apps sequentially within each child. Children own distinct worktrees, ports, cloned databases, tabs and result files. The coordinator gathers results and owns GitHub publication.
+Use one bounded runtime per PR, owned by one child; one runtime-owning child runs at a time on this machine (16 GB shared with the browser and other threads). Children own distinct worktrees, ports, cloned databases, tabs and result files. The coordinator gathers results and owns GitHub publication.
+
+Reuse saved helpers before writing new ones: a login, database or polling script written for one PR goes into the run's `helpers/` directory with a usage line, and later scenarios call it instead of a fresh copy. Batch a scenario's browser steps into one exec call when the steps need no judgement between them.
 
 Choose the target's [project profile](project-profiles.md) before preparing a runtime. For JouleMV only, from the disposable worktree run this skill's bundled helper:
 
 ```sh
 python3 "$SKILL_DIR/scripts/agent_run.py" doctor
-python3 "$SKILL_DIR/scripts/agent_run.py" start --schema-mode current
+python3 ~/.codex/skills/respond/scripts/heavy_lock.py --label runtime-start -- \
+  python3 "$SKILL_DIR/scripts/agent_run.py" start --schema-mode current
 ```
+
+`heavy_lock.py` holds the machine-wide heavy slot only while the runtime builds and starts, so it never overlaps a respond-all fixer's build; wrap WebSynco builds and installs the same way.
 
 Choose `current` only when the reviewed change adds no tenant SQL migration and the existing cloned schema can exercise its behavior. It clones local data unchanged and does not verify migration execution. For SQL migration changes, choose `--schema-mode migrate`; a migration failure remains a blocker unless the actual prerequisite can be corrected within the owned fixture scope. Do not bypass the migration being tested. The helper checks local source DB identity and ownership, disables external notification transports, uses private Vite caches, and records commit/schema mode in its receipts.
 

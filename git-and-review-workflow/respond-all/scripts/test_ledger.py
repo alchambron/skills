@@ -110,7 +110,7 @@ class LedgerTests(unittest.TestCase):
             {"pr": self.url(2), "set": {"phase": "fix", "status": "running"}},
         ])
         text = ledger.summary(data)
-        self.assertIn("children=2/4 fixers=1/1", text.splitlines()[0])
+        self.assertIn("children=2/4 fixers=1/3", text.splitlines()[0])
         self.assertIn("example/repo#1\tanalysis/running\tsha1\tchild=a1", text)
         filtered = ledger.summary(data, phase="fix").splitlines()
         self.assertEqual(len(filtered), 3)
@@ -136,7 +136,7 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(snapshot["batchTotal"], 7)
         self.assertEqual(snapshot["counts"], dict.fromkeys(ledger.PROGRESS_STATES, 1))
         self.assertEqual((snapshot["activeChildren"], snapshot["activeFixers"]), (1, 1))
-        self.assertIn("children=1/4 fixers=1/1", ledger.summary(data))
+        self.assertIn("children=1/4 fixers=1/3", ledger.summary(data))
         self.assertEqual(snapshot["entries"][3]["state"], "waiting_ci")
 
     def test_terminal_label_cannot_hide_pending_actions_drafts_or_blockers(self):

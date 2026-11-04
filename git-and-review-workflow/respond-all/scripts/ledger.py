@@ -35,7 +35,7 @@ SCHEMA_VERSION = 2
 PHASES = {"queued", "analysis", "fix", "publish", "respond", "monitor", "done", "blocked"}
 STATUSES = {"queued", "running", "awaiting_authorization", "blocked", "completed", "skipped"}
 ACTION_STATUSES = {"planned", "in_flight", "verified", "blocked"}
-DEFAULT_LIMITS = {"maximumActiveChildren": 4, "maximumFixers": 1,
+DEFAULT_LIMITS = {"maximumActiveChildren": 4, "maximumFixers": 3,
                   "maximumCpuHeavyLocalOperations": 1, "batchSize": 12}
 OP_LIMIT = 8192
 
