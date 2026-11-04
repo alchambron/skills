@@ -407,10 +407,27 @@ def prepare_vite(run_id):
     config.write_text(
         "import baseConfig from './vite.config.ts';\n"
         "import { mergeConfig } from 'vite';\n"
-        "export default mergeConfig(baseConfig, { cacheDir: " + json.dumps(str(cache)) + " });\n",
+        "// vite.config.ts exports either an object or a function of the config env.\n"
+        "export default async (env) => mergeConfig(typeof baseConfig === 'function' ? await baseConfig(env) : "
+        "await baseConfig, { cacheDir: " + json.dumps(str(cache)) + " });\n",
         encoding="utf-8",
     )
     return config
+
+
+def frontend_api_env(backend_url):
+    """Route API calls through the worktree's Vite proxy when it has one.
+
+    Auth cookies reject an absolute cross-origin backend URL, so heads whose vite.config.ts
+    proxies to VITE_DEV_API_UPSTREAM call the API on Vite's own origin.
+    """
+    try:
+        proxied = "VITE_DEV_API_UPSTREAM" in (ROOT / "frontend" / "vite.config.ts").read_text(encoding="utf-8")
+    except OSError:
+        proxied = False
+    if proxied:
+        return {"VITE_API_URL": "/", "VITE_LEGACY_API_URL": "/", "VITE_DEV_API_UPSTREAM": backend_url}
+    return {"VITE_API_URL": backend_url, "VITE_LEGACY_API_URL": backend_url}
 
 
 def cleanup_vite(run_id):
@@ -583,10 +600,11 @@ def start(timeout, max_runtime_minutes, schema_mode="migrate"):
                        "APP_LOCAL_DIR": str(STATE_DIR / "files"),
                        "SENTRY_DSN": "", "SENTRY_LOGS_ENABLED": "false",
                        "SMTP_HOST": "127.0.0.1", "SMTP_PORT": "1",
+                       # The runtime serves loopback HTTP, where Secure auth cookies are never sent back.
+                       "SECURE_AUTH_COOKIES": "false",
                        "FORMULA_THRESHOLD_NOTIFICATION_POLL_DELAY_MS": "86400000"}
             (STATE_DIR / "files").mkdir(exist_ok=True)
-            frontend_env = {**os.environ, **values, "VITE_API_URL": backend_url,
-                            "VITE_LEGACY_API_URL": backend_url, "VITE_SENTRY_DSN": ""}
+            frontend_env = {**os.environ, **values, **frontend_api_env(backend_url), "VITE_SENTRY_DSN": ""}
             with open(STATE_DIR / "backend.log", "a", encoding="utf-8") as be_log:
                 backend = subprocess.Popen([str(Path(java["JAVA_HOME"]) / "bin/java"), "-jar", str(artifact)],
                                            cwd=ROOT, env=app_env, stdout=be_log, stderr=subprocess.STDOUT,

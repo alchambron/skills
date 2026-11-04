@@ -287,6 +287,73 @@ def resume(path, api=None, host=None):
     return data
 
 
+REVISION_GAPS = ("Revision changed; prior outcomes are archived and require revalidation",)
+
+
+def previous_outcome(previous, pr, from_head):
+    """The earlier run's outcome for this PR at from_head, current or archived."""
+    match = next((item for item in previous["prs"]
+                  if (item["repository"], item["number"]) == (pr["repository"], pr["number"])), None)
+    if match is None:
+        return None
+    if match.get("head_sha") == from_head:
+        return match
+    return next((item for item in reversed(match.get("revision_history", []))
+                 if item.get("head_sha") == from_head), None)
+
+
+def carry(path):
+    """Copy outcomes for PRs whose `review_basis.mode` is carry from the run that reviewed the same code."""
+    carried, skipped = [], []
+    with locked(path) as target:
+        data = read(target)
+        for pr in data["prs"]:
+            basis = pr.get("review_basis") or {}
+            if basis.get("mode") != "carry":
+                continue
+            label = f"{pr['repository']}#{pr['number']}"
+            if pr["review"]["status"] != "pending" or pr["scenarios"]:
+                skipped.append({"pr": label, "reason": "stages already recorded in this run"})
+                continue
+            source_path = Path(basis.get("previousRun") or "") / "results.json"
+            try:
+                source = previous_outcome(read(source_path), pr, basis.get("fromHead"))
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                skipped.append({"pr": label, "reason": f"{source_path}: {exc}"})
+                continue
+            if source is None or source.get("review", {}).get("status") not in ("clean", "issues"):
+                skipped.append({"pr": label, "reason": f"no finished review at {basis.get('fromHead')} in {source_path}"})
+                continue
+            files = basis.get("changedFiles", [])
+            origin = {"run": str(source_path.parent), "head_sha": basis["fromHead"], "base_sha": source.get("base_sha"),
+                      "changed_files": files}
+            note = (f"Carried from {origin['run']} at {basis['fromHead'][:12]}: the new commits change only "
+                    f"documentation ({', '.join(files[:5])}{', ...' if len(files) > 5 else ''})")
+            pr["review"] = copy.deepcopy(source["review"])
+            pr["review"]["limits"] = pr["review"].get("limits", []) + [note]
+            publication = copy.deepcopy(source.get("publication") or {"status": "pending"})
+            if publication.get("status") in ("not_required", "not_requested"):
+                pr["publication"] = publication
+            else:
+                # Existing threads still apply to identical code; reuse them through the publishing skill's readback.
+                pr["publication"] = {"status": "pending", "carried_from": publication}
+            pr["live"] = {**copy.deepcopy(source.get("live") or {"status": "pending"}), "carried_from": origin}
+            pr["scenarios"] = [{**copy.deepcopy(item), "carried_from": {"run": origin["run"], "head_sha": origin["head_sha"]}}
+                               for item in source.get("scenarios", [])]
+            if source.get("runtime_provenance"):
+                pr["runtime_provenance"] = copy.deepcopy(source["runtime_provenance"])
+            gaps = [gap for gap in source.get("coverage_gaps", []) if gap not in REVISION_GAPS and gap not in pr["coverage_gaps"]]
+            pr["coverage_gaps"] = pr["coverage_gaps"] + gaps + [note]
+            pr["updated_at"] = now()
+            pr.pop("current_base_sha", None)
+            pr.pop("current_head_sha", None)
+            carried.append({"pr": label, "review": pr["review"]["status"], "publication": pr["publication"]["status"],
+                            "live": pr["live"]["status"], "scenarios": len(pr["scenarios"])})
+        if carried:
+            save(target, data)
+    return {"carried": carried, "skipped": skipped}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -301,11 +368,16 @@ def main(argv=None):
     update.add_argument("--head-sha", required=True)
     update.add_argument("--section", required=True, choices=SECTIONS)
     update.add_argument("--data", required=True, type=Path)
+    transfer = commands.add_parser("carry", help="Copy earlier outcomes to PRs selected in carry mode")
+    transfer.add_argument("--input", required=True, type=Path)
     refresh = commands.add_parser("resume", help="Refresh saved PRs and reconcile publication without posting")
     refresh.add_argument("--input", required=True, type=Path)
     refresh.add_argument("--host")
     args = parser.parse_args(argv)
     try:
+        if args.command == "carry":
+            print(json.dumps(carry(args.input)))
+            return 0
         if args.command == "init":
             data = initialize(args.snapshot, args.output)
         elif args.command == "record":

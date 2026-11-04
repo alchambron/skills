@@ -68,10 +68,42 @@ class HistoryTests(unittest.TestCase):
     def test_moved_head_is_incremental_and_listed_first(self):
         self.state({"EnerZam/JouleMV#10": {"reviewedHead": HEAD, "reviewedBase": BASE, "complete": True,
                                            "outcome": "clean"}})
-        result = self.select(self.api([pull(11), pull(10, head=NEW_HEAD)]))
+        api = self.api([pull(11), pull(10, head=NEW_HEAD)])
+        api.responses[f"repos/EnerZam/JouleMV/compare/{HEAD}...{NEW_HEAD}"] = {
+            "status": "ahead", "files": [{"filename": "src/main/App.java"}]}
+        result = self.select(api)
         self.assertEqual([c["kind"] for c in result["selected"]], ["moved", "new"])
         self.assertEqual(result["selected"][0]["basis"], {"mode": "incremental", "fromHead": HEAD, "fromBase": BASE,
                                                           "previousOutcome": "clean", "previousRun": None})
+
+    def moved(self, compare, complete=True):
+        self.state({"EnerZam/JouleMV#10": {"reviewedHead": HEAD, "reviewedBase": BASE, "complete": complete,
+                                           "outcome": "issues", "publication": "reused", "runDir": "/runs/earlier"}})
+        api = self.api([pull(10, head=NEW_HEAD)])
+        if compare is not None:
+            api.responses[f"repos/EnerZam/JouleMV/compare/{HEAD}...{NEW_HEAD}"] = compare
+        return self.select(api)
+
+    def test_documentation_only_delta_carries_the_earlier_outcome(self):
+        result = self.moved({"status": "ahead", "files": [{"filename": "docs/feature-map/index.json"},
+                                                          {"filename": "README.md"}]})
+        basis = result["selected"][0]["basis"]
+        self.assertEqual((basis["mode"], basis["fromHead"], basis["previousRun"]), ("carry", HEAD, "/runs/earlier"))
+        self.assertEqual(basis["changedFiles"], ["docs/feature-map/index.json", "README.md"])
+
+    def test_code_rebase_failed_compare_or_unfinished_history_stay_incremental(self):
+        cases = [({"status": "ahead", "files": [{"filename": "docs/a.md"}, {"filename": "src/app.ts"}]}, True),
+                 ({"status": "ahead", "files": [{"filename": "src/help/guide.md"}]}, True),
+                 ({"status": "ahead", "files": [{"filename": "notes.md", "previous_filename": "app.py"}]}, True),
+                 ({"status": "diverged", "files": [{"filename": "docs/a.md"}]}, True),
+                 ({"status": "ahead", "files": [{"filename": f"docs/{i}.md"} for i in range(300)]}, True),
+                 ({"status": "ahead", "files": [{"filename": "docs/a.md"}]}, False)]
+        for compare, complete in cases:
+            with self.subTest(compare=str(compare)[:80], complete=complete):
+                self.assertEqual(self.moved(compare, complete)["selected"][0]["basis"]["mode"], "incremental")
+        result = self.moved(collector.CollectionError("compare unavailable"))
+        self.assertEqual(result["selected"][0]["basis"]["mode"], "incremental")
+        self.assertTrue(any("compare" in warning for warning in result["warnings"]))
 
     def test_rerequest_only_after_a_submitted_request_changes(self):
         self.state({"EnerZam/JouleMV#10": {"reviewedHead": HEAD, "complete": True, "outcome": "issues",
