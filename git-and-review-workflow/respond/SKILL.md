@@ -16,7 +16,7 @@ The parent schedules work, records compact ledger results, presents rendered pla
 
 Use native subagents for supported same-provider work and T3 `delegate_task` for isolation, other providers or requested settings. Follow the tool's orchestration/continuation instructions. A fixer needs an isolated checkout with one writer, assigned exact head and stable request ID. If delegation is unavailable, report that blocker. Delegation adds no authorization.
 
-A brief carries variables, not copied instructions: role/reference, PR URL/head/base, untouched or approved row IDs, run directory, exact authorization/limits, and resource slot. Use clean context when supported. Source, logs and full reports stay on disk; each result is one line with PR URL, head, outcome, artifact path and remaining objections.
+A brief carries variables, not copied instructions: role/reference, PR URL/head/base, untouched or approved row IDs, run directory, exact authorization/limits, and resource slot. Start every child with clean context: native Codex agents get `fork_turns: "none"`, since a forked child re-reads the parent's history on every step. Source, logs and full reports stay on disk; each result is one line with PR URL, head, outcome, artifact path and remaining objections.
 
 ## Artifacts and plans
 
