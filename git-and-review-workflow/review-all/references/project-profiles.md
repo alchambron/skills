@@ -34,7 +34,7 @@ For each PR:
 
 Record the frontend/backend SHAs, URLs, tenant, schema mode/version, owned database/process identities and resolved filesystem ownership in `runtime_provenance` using the [results contract](results-format.md). Frontend-head-only evidence uses the exact frontend PR head with the recorded backend dependency pin. A selected backend PR requires its own review and evidence; it is not silently substituted for the dependency of every frontend PR. Recheck both runtime pins before reporting results.
 
-Execute the normal feature scenarios in [T3 Code Navigator](live-testing.md#browser-and-fixtures), following the shared [browser contract](live-testing.md#browser-and-fixtures) for tab reuse, ownership and host-authorized failure handling. Fixture-backed Vitest and Storybook checks supplement live evidence; inspect the local testing skill rather than requiring a Playwright E2E suite that this checkout may not configure.
+Execute the normal feature scenarios as [scripts in the headless runner](live-testing.md#run-scenarios-as-scripts). Use the [T3 Code Navigator](live-testing.md#browser-and-fixtures) for watched or interactive checks, following the shared [browser contract](live-testing.md#browser-and-fixtures) for tab reuse, ownership and host-authorized failure handling. Fixture-backed Vitest and Storybook checks supplement live evidence; inspect the local testing skill rather than requiring a Playwright E2E suite that this checkout may not configure.
 
 ### Cleanup
 

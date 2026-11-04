@@ -20,6 +20,7 @@ Plan scenarios during static review, including for PRs with defects. Record unex
 
 Each scenario has a stable `id` unique within its PR, `title`, `preconditions`, `route`, `steps` array, `expected`, `actual`, and `status`. Its full identity is `repository` + PR `number` + scenario `id`; another PR may reuse the same scenario ID. Status is one of `pass`, `fail`, `blocked`, `observed`, `partial`, or `spec_gap`. Preconditions/expected/actual may be text or structured JSON. Also retain:
 
+- `script` and `result`: for a scripted scenario, the scenario script and the runner's `result.json`. A later run replays `script` when it reruns the scenario.
 - `screenshots`: local image paths saved from the browser. Include only images inspected for legibility and agreement with the observed outcome. Describe missing visual evidence in `visual_evidence` or `coverage_gaps`.
 - `exports`: objects with `file_name`, `path`, and optional `verification` describing inspected contents. Copy downloads into the run's evidence directory immediately.
 - `cleanup`: the scenario's restoration instructions or the disposable-runtime cleanup.
