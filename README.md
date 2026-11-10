@@ -43,6 +43,8 @@ Install the complete folders below into your agent's personal skills directory (
 
 The repository uses category-relative dependency links; flattened installations resolve those dependencies through the installed skill catalog as described in `review-all`. The browser skill's declared name is `browser-testing`; its installed folder above matches the sibling links used by existing personal skills. Remove or disable an obsolete `joulemv-review-all` entry only after confirming the new installation, so invocations cannot select the old workflow accidentally.
 
+The full workflow requires all five companion skills above. Its dependency checker runs before batch work; missing or invalid skills stop the batch and produce installation links to this repository. Copy the updated `review-all` folder as a unit so its checker and command guards stay together.
+
 Invoke `/review-all` in Claude Code or `$review-all` in Codex. Clean reviews must proceed through `manual-test-guide`, execution of the planned live scenarios, and an illustrated HTML report. T3 Code displays that report inline; other hosts receive the generated `scenario-guide.html` file. No separate request to run tests is needed. Missing runtime prerequisites remain explicit blockers, and token telemetry is optional outside Codex. Test databases, credentials and saved login sessions are machine-local prerequisites; they are not distributed with the skills.
 
 ## Multi-agent setup for Codex

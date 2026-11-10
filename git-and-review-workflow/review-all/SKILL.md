@@ -13,6 +13,36 @@ Explicit `$review-all`, `/review-all`, or the explicit batch-review request abov
 
 Never submit `APPROVE`, merge, deploy, fix PR source, or contact people by email/chat through this workflow. Keep the user's checkout intact. Test notifications with local collectors, not external recipients.
 
+## Dependency guard — stop before starting
+
+Every invocation, including a resumed batch, starts with this local check. Resolve `SKILL_DIR` from the loaded skill's actual directory and run:
+
+```sh
+python3 "$SKILL_DIR/scripts/check_dependencies.py"
+```
+
+The complete `review-all` installation requires all five companion skills before collection, even when the eventual batch might not use every phase. Installing a dependency does not authorize a phase excluded by the user. The check verifies readable skill instructions, the declared skill identity, and known required supporting files. Its JSON lists resolved paths or the missing/invalid dependencies, searched paths, install-folder names and source URLs.
+
+| Companion skill | Install the complete folder from |
+| --- | --- |
+| `code-review` | [code-review](https://github.com/alchambron/skills/tree/main/git-and-review-workflow/code-review) |
+| `manual-test-guide` | [manual-test-guide](https://github.com/alchambron/skills/tree/main/testing-and-quality/manual-test-guide) |
+| `github-inline-review` | [github-inline-review](https://github.com/alchambron/skills/tree/main/git-and-review-workflow/github-inline-review) |
+| `joulemv-code-review` | [joulemv-code-review](https://github.com/alchambron/skills/tree/main/git-and-review-workflow/joulemv-code-review) |
+| `browser-testing` | [browser-testing](https://github.com/alchambron/skills/tree/main/testing-and-quality/browser-testing) — installed folder `joulemv-browser-testing` or `browser-testing` |
+
+**Exit 2, a check error, or a missing checker means the batch must not start.** Do not collect PRs, launch review/test agents, create worktrees, install runtime dependencies, start services, run scenarios or publish reviews. Show the returned `message` as readable Markdown with clickable links, identify the missing or invalid files, and explicitly ask the user to install or update those complete folders in their configured skills directory (`~/.codex/skills` or `~/.claude/skills` by default). If this skill's checker itself is absent, link [review-all](https://github.com/alchambron/skills/tree/main/git-and-review-workflow/review-all) and request its complete folder. Then stop and wait for installation; do not continue independent batch work or offer a reduced review. Do not silently install or download skills. Owned-resource cleanup remains permitted if this is an interrupted run.
+
+For example: “review-all did not start. Please install [manual-test-guide](https://github.com/alchambron/skills/tree/main/testing-and-quality/manual-test-guide), including its full folder, then tell me when it is installed so I can recheck.”
+
+The helper searches sibling skills, standard Codex/Claude/agent skill roots and this repository's category folders. For a custom or plugin installation, resolve its actual local skill roots and set `REVIEW_SKILLS_DIRS` to those directories, separated by the platform's path separator; pass that environment to every workflow command and child. This overrides the default search roots. `--skills-root` on the checker tests explicit roots only. A catalog entry without readable files does not pass. Load the exact dependency paths returned by the check rather than another same-name copy.
+
+**Only exit 0 permits starting.** Tell the user the required skills are available and proceed without another confirmation. After the user reports installation, rerun the check; their confirmation alone is not a pass. The selection, collection, JouleMV runtime-start and scenario-run/setup commands also enforce the check and exit 2 before work when it fails. Never bypass these checks by switching tools or invoking lower-level helpers directly.
+
+Once the ledger exists, record the resolved dependency paths in its coverage notes and pass the resolved `manual-test-guide` path to scenario children. Read `references/live-testing.md` and `references/results-format.md` before acceptance. This guard verifies the companion installation; it does not prove runtime prerequisites, credentials, or semantic compatibility of an arbitrary older skill revision. Copying only `SKILL.md` is insufficient: `review-all` also requires its bundled scripts, references and report assets.
+
+The workflow must work without the author's saved sessions or helper cache. Use the first-run procedure in `live-testing.md`. When the host lacks subagents, perform the same stages sequentially in the current agent; delegation is an optimization, not an acceptance prerequisite. Apply this host fallback to dependency skills that otherwise assume parallel agents. Outside T3 Code, use the bundled scenario runner subject to the host's browser policy and deliver the standalone HTML. Optional token telemetry must not block testing or report delivery.
+
 ## Required outcome
 
 A clean static review is the trigger for live acceptance, not the end of the task. For every selected PR with no actionable static findings, continue automatically through **manual-test-guide → live scenario execution → HTML report**. Do not ask whether to test or offer testing as a follow-up. Apply explicit user restrictions; record any resulting unexecuted coverage honestly.
@@ -21,26 +51,6 @@ A clean static review is the trigger for live acceptance, not the end of the tas
 - Execute every required scenario against the pinned revision and real dependencies. A checklist, green CI, unit tests, a server health check or login alone does not complete acceptance. Backend-only changes need concrete technical acceptance when no UI applies. Use `live.status: not_required` only with a recorded source-based reason that no executable behavior is affected, never because review was clean or setup failed.
 - Reuse prior acceptance only under the history rules below and after checking that its saved scenarios, observations and runtime provenance establish the claimed coverage. Missing artifacts or unfinished coverage require execution. Label carried evidence as prior execution, not a fresh test.
 - Always create and link the HTML report for a selected batch, including failures and blockers. Missing inline-display tools change how the report is delivered, not whether the HTML file is generated. A blocked report is an incomplete checkpoint; continue independent work and seek the missing prerequisite.
-
-## Dependency guard — run before starting
-
-On every invocation, tell the user that `review-all` requires companion skills, then verify their availability. Resolve `SKILL_DIR` from the actual loaded `SKILL.md`, including plugin caches. Resolve dependency skills from their links, then the host's installed skill catalog or the shared repository's category folders. Verify each required `SKILL.md` is readable and the referenced resources needed for this run are available; a catalog entry alone does not prove installation is complete.
-
-| Required skill | When required | Usual installed folder |
-| --- | --- | --- |
-| `code-review` | Every batch | `code-review` |
-| `manual-test-guide` | Every batch, including clean reviews | `manual-test-guide` |
-| `github-inline-review` | Batches permitting review publication | `github-inline-review` |
-| `joulemv-code-review` | JouleMV PRs | `joulemv-code-review` |
-| `browser-testing` | Browser acceptance scenarios | `joulemv-browser-testing` (or `browser-testing`) |
-
-Check the known requirements before collecting reviews. If project-specific requirements become known only after collection, check them before reviewing or starting that project's runtime. Summarize the check in one user-facing message with the required names and `available` or `missing`; mark inapplicable dependencies as not needed for this batch. When all required skills are available, proceed without asking for confirmation.
-
-If a required skill is missing or incomplete, name it, show the paths searched and the missing resource, and tell the user to install or copy its **complete folder** into their host's skill directory (`~/.codex/skills` or `~/.claude/skills`, or the configured equivalent). Pause the affected workflow until the dependency is available and the check passes; continue only independent work whose dependencies are satisfied. Do not substitute an improvised review, skip live testing, or treat a dependency failure as a clean result. Resolving an already available copy is allowed; installing or downloading skills requires the user's installation authorization.
-
-Record the resolved dependency paths in the run's coverage notes once the ledger exists, and pass the resolved `manual-test-guide` path to scenario children. Read this copy's `references/live-testing.md` and `references/results-format.md` before scheduling acceptance. Copying only `SKILL.md` is insufficient: `review-all` also requires its bundled scripts, references and report assets.
-
-The workflow must work without the author's saved sessions or helper cache. Use the first-run procedure in `live-testing.md`. When the host lacks subagents, perform the same stages sequentially in the current agent; delegation is an optimization, not an acceptance prerequisite. Apply this host fallback to dependency skills that otherwise assume parallel agents. Outside T3 Code, use the bundled scenario runner subject to the host's browser policy and deliver the standalone HTML. Optional token telemetry must not block testing or report delivery.
 
 ## 1. Collect and pin
 
