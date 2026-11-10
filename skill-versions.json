@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "skills": {
+    "review-all": {
+      "version": "1.0.0",
+      "path": "git-and-review-workflow/review-all"
+    },
+    "code-review": {
+      "version": "1.0.0",
+      "path": "git-and-review-workflow/code-review"
+    },
+    "manual-test-guide": {
+      "version": "1.0.0",
+      "path": "testing-and-quality/manual-test-guide"
+    },
+    "github-inline-review": {
+      "version": "1.0.0",
+      "path": "git-and-review-workflow/github-inline-review"
+    },
+    "joulemv-code-review": {
+      "version": "1.0.0",
+      "path": "git-and-review-workflow/joulemv-code-review"
+    },
+    "browser-testing": {
+      "version": "1.0.0",
+      "path": "testing-and-quality/browser-testing"
+    }
+  }
+}

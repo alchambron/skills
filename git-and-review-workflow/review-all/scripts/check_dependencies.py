@@ -13,6 +13,7 @@ from pathlib import Path
 import re
 import sys
 
+from skill_versions import check_updates, parse_version, read_version, requirements, version_status
 
 SOURCE = "https://github.com/alchambron/skills/tree/main/"
 DEPENDENCIES = (
@@ -61,31 +62,57 @@ def inspect_skill(folder, name, resources):
     return None
 
 
-def check(roots=None):
+def check(roots=None, skill_dir=None):
+    skill_dir = Path(skill_dir) if skill_dir else Path(__file__).resolve().parent.parent
+    own = {"name": "review-all", "path": str(skill_dir), "installed_version": None,
+           "url": SOURCE + "git-and-review-workflow/review-all", "status": "available"}
+    try:
+        own["installed_version"] = read_version(skill_dir)
+        parse_version(own["installed_version"])
+        required = requirements(skill_dir, [item[0] for item in DEPENDENCIES])
+    except (OSError, UnicodeError, ValueError, TypeError, KeyError):
+        own.update(status="update_required", reason="VERSION or requirements.json is missing or invalid; update the complete review-all folder")
+        return {"ok": False, "status": "installation_required", "skill": own, "dependencies": []}
     roots = installation_roots(roots)
     dependencies = []
     for name, folders, source, resources in DEPENDENCIES:
         candidates = [root / folder for root in roots for folder in folders]
         errors = []
         selected = None
+        outdated = None
+        installed = None
+        limits = required[name]
         for candidate in candidates:
             error = inspect_skill(candidate, name, resources)
             if error is None:
-                selected = candidate
-                break
+                installed, error = version_status(candidate, limits)
+                if error is None:
+                    selected = candidate
+                    break
+                if outdated is None:
+                    outdated = {"path": str(candidate), "installed_version": installed, "reason": error}
             errors.append({"path": str(candidate), "reason": error})
-        dependencies.append({"name": name, "status": "available" if selected else "missing_or_invalid",
+        item = {"name": name, "status": "available" if selected else ("update_required" if outdated else "missing_or_invalid"),
                              "path": str(selected) if selected else None, "install_folder": folders[0],
-                             "url": SOURCE + source, "searched": errors if selected is None else []})
+                             "installed_version": installed if selected else None,
+                             "required_version": f">={limits['minimum']}, <{limits['maximum_exclusive']}",
+                             "url": SOURCE + source, "searched": errors if selected is None else []}
+        if selected is None and outdated:
+            item.update(outdated)
+        dependencies.append(item)
     ready = all(item["status"] == "available" for item in dependencies)
-    return {"ok": ready, "status": "ready" if ready else "installation_required", "dependencies": dependencies}
+    return {"ok": ready, "status": "ready" if ready else "installation_required", "skill": own, "dependencies": dependencies}
 
 
 def notice(result):
     lines = ["review-all did not start. Please install or update these complete skill folders:"]
+    if result.get("skill", {}).get("status") != "available":
+        own = result["skill"]
+        lines.append(f"- [review-all]({own['url']}): {own['reason']}")
     for item in result["dependencies"]:
         if item["status"] != "available":
-            lines.append(f"- [{item['name']}]({item['url']}) → {item['install_folder']}")
+            installed = item.get("installed_version") or "unversioned or missing"
+            lines.append(f"- [{item['name']}]({item['url']}): installed {installed}; required {item['required_version']} → {item['install_folder']}")
     lines.append("Use your configured skills directory (~/.codex/skills or ~/.claude/skills by default), "
                  "including each folder's references and supporting files. Then rerun the dependency check.")
     return "\n".join(lines)
@@ -103,10 +130,13 @@ def require_dependencies():
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--skills-root", action="append", help="Directory containing installed skill folders")
+    parser.add_argument("--check-updates", action="store_true", help="Also check published versions through read-only gh API access")
     args = parser.parse_args(argv)
     result = check(args.skills_root)
     if not result["ok"]:
         result["message"] = notice(result)
+    if args.check_updates and result["ok"]:
+        check_updates(result)
     print(json.dumps(result, ensure_ascii=False))
     return 0 if result["ok"] else 2
 

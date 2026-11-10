@@ -43,9 +43,15 @@ Install the complete folders below into your agent's personal skills directory (
 
 The repository uses category-relative dependency links; flattened installations resolve those dependencies through the installed skill catalog as described in `review-all`. The browser skill's declared name is `browser-testing`; its installed folder above matches the sibling links used by existing personal skills. Remove or disable an obsolete `joulemv-review-all` entry only after confirming the new installation, so invocations cannot select the old workflow accidentally.
 
-The full workflow requires all five companion skills above. Its dependency checker runs before batch work; missing or invalid skills stop the batch and produce installation links to this repository. Copy the updated `review-all` folder as a unit so its checker and command guards stay together.
+The full workflow requires all five companion skills above. Each of these six folders has a canonical `VERSION` file in `X.Y.Z` format, initially `1.0.0`. `review-all/requirements.json` declares the compatible companion versions with an inclusive minimum and exclusive upper bound. Its dependency checker runs before batch work; a missing or invalid `VERSION`, an incompatible companion version, or missing required files stops the batch with the installed and required versions and update links. Copy each updated folder as a unit, including its `VERSION`; changing a version number alone does not update older code.
+
+At startup, `review-all` also checks this repository's [`skill-versions.json`](skill-versions.json) on `main` through authenticated `gh` access. It recommends available newer releases without installing them or blocking a locally compatible batch. When the network, authentication or catalog is unavailable, it reports that the latest versions are unknown and still enforces local compatibility. Legacy copies cannot notify you about this mechanism until you update `review-all` once.
 
 Invoke `/review-all` in Claude Code or `$review-all` in Codex. Clean reviews must proceed through `manual-test-guide`, execution of the planned live scenarios, and an illustrated HTML report. T3 Code displays that report inline; other hosts receive the generated `scenario-guide.html` file. No separate request to run tests is needed. Missing runtime prerequisites remain explicit blockers, and token telemetry is optional outside Codex. Test databases, credentials and saved login sessions are machine-local prerequisites; they are not distributed with the skills.
+
+### Maintaining versions
+
+For each changed versioned skill, bump its `VERSION`: patch for a fix, minor for a compatible addition, major for an incompatible change. Update its latest version in [`skill-versions.json`](skill-versions.json), and adjust the relevant dependency ranges in [`review-all/requirements.json`](git-and-review-workflow/review-all/requirements.json) when required contracts change. Release the version file with the corresponding complete skill folder. Versions declare releases and compatibility; they are not integrity hashes.
 
 ## Multi-agent setup for Codex
 

@@ -34,6 +34,7 @@ class DependencyTests(unittest.TestCase):
             folder = self.skills / (browser_folder if name == "browser-testing" else folders[0])
             folder.mkdir(parents=True, exist_ok=True)
             (folder / "SKILL.md").write_text(f"---\nname: {name}\ndescription: Test fixture\n---\nInstructions.\n")
+            (folder / "VERSION").write_text("1.0.0\n")
             for resource in resources:
                 target = folder / resource
                 target.parent.mkdir(parents=True, exist_ok=True)
@@ -51,6 +52,11 @@ class DependencyTests(unittest.TestCase):
         with contextlib.redirect_stdout(output):
             self.assertEqual(guard.main(["--skills-root", str(self.skills)]), 2)
         self.assertEqual(json.loads(output.getvalue())["status"], "installation_required")
+
+    def test_failed_local_check_does_not_contact_published_catalog(self):
+        with contextlib.redirect_stdout(io.StringIO()), patch.object(guard, "check_updates") as remote:
+            self.assertEqual(guard.main(["--check-updates"]), 2)
+        remote.assert_not_called()
 
     def test_complete_installation_and_both_browser_folder_names(self):
         for folder in ("joulemv-browser-testing", "browser-testing"):
@@ -78,6 +84,48 @@ class DependencyTests(unittest.TestCase):
         empty.mkdir()
         self.assertFalse(guard.check([empty])["ok"])
         self.assertTrue(guard.check([empty, self.skills])["ok"])
+
+    def test_unversioned_and_incompatible_copies_require_update(self):
+        self.install()
+        version = self.skills / "manual-test-guide/VERSION"
+        for value in (None, "0.9.0", "2.0.0", "1.0", "1.0.0-beta", "01.0.0"):
+            with self.subTest(version=value):
+                if value is None:
+                    version.unlink(missing_ok=True)
+                else:
+                    version.write_text(value)
+                result = guard.check()
+                self.assertFalse(result["ok"])
+                item = next(item for item in result["dependencies"] if item["name"] == "manual-test-guide")
+                self.assertEqual(item["status"], "update_required")
+                self.assertEqual(item["installed_version"], value)
+                self.assertIn("required >=1.0.0, <2.0.0", guard.notice(result))
+                with contextlib.redirect_stderr(io.StringIO()), patch.object(history, "GitHub") as api:
+                    self.assertEqual(history.main(["select"]), 2)
+                api.assert_not_called()
+
+    def test_compatible_newer_minor_version_passes(self):
+        self.install()
+        (self.skills / "manual-test-guide/VERSION").write_text("1.10.0\n")
+        self.assertTrue(guard.check()["ok"])
+
+    def test_review_all_version_and_requirements_are_mandatory(self):
+        self.install()
+        own = self.root / "review-all"
+        own.mkdir()
+        self.assertFalse(guard.check(skill_dir=own)["ok"])
+        (own / "VERSION").write_text("1.0.0\n")
+        (own / "requirements.json").write_text('{"schema_version":1,"requires":{}}')
+        self.assertFalse(guard.check(skill_dir=own)["ok"])
+        baseline = Path(guard.__file__).resolve().parent.parent / "requirements.json"
+        requirements = json.loads(baseline.read_text())
+        requirements["requires"]["code-review"]["minimum"] = "1.2.0"
+        (own / "requirements.json").write_text(json.dumps(requirements))
+        result = guard.check(skill_dir=own)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["dependencies"][0]["required_version"], ">=1.2.0, <2.0.0")
+        (self.skills / "code-review/VERSION").write_text("1.2.0\n")
+        self.assertTrue(guard.check(skill_dir=own)["ok"])
 
     def test_batch_commands_stop_before_github_or_state_creation(self):
         with contextlib.redirect_stderr(io.StringIO()), \
