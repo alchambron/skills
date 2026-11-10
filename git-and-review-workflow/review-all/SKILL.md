@@ -1,13 +1,15 @@
 ---
 name: review-all
-description: Review all requested GitHub PRs, publish verified defects, then use manual-test-guide to execute live acceptance for every clean PR and deliver an illustrated HTML report. Supports JouleMV, WebSynco and repository-specific runtimes, in T3 Code or another supported host.
+description: Use when the user explicitly asks to review all PRs, including "review all the PRs" or "review all PRs requesting my review", or invokes /review-all or $review-all. Check required skills, review the selected batch, publish verified defects, live-test clean PRs using manual-test-guide, and deliver an illustrated HTML report.
 ---
 
 # Review all my PRs
 
 Own the whole batch in the current thread: collect the user's requested reviews, review every selected PR, publish verified defects, plan acceptance coverage for every PR, execute meaningful feature tests, and show one illustrated result. Subagents are child work of this thread; separate top-level PR conversations belong to [joulemv-review-launcher](../joulemv-review-launcher/SKILL.md).
 
-Explicit `$review-all`, `/review-all`, or an unambiguous request to run this complete workflow authorizes inline `REQUEST_CHANGES` reviews for verified defects and isolated local testing, including reversible fixture changes in owned test databases. This also covers defects discovered during live testing. Proceed without a picker or repeated publication confirmation. An ordinary read-only review request that merely causes implicit skill selection does not grant publication permission. Honor narrower user instructions, existing authorization, repository policies, and read-only/local-only boundaries. Skill creation is never an instruction to run reviews.
+An explicit natural-language request such as "review all the PRs" invokes this workflow without requiring its slash command. Use the user's specified PR batch or repository scope; when no scope is given, default to PRs requesting their review. A request to edit this skill, list PRs, or review a single PR does not invoke the batch workflow.
+
+Explicit `$review-all`, `/review-all`, or the explicit batch-review request above authorizes inline `REQUEST_CHANGES` reviews for verified defects and isolated local testing, including reversible fixture changes in owned test databases. This also covers defects discovered during live testing. Proceed without a picker or repeated publication confirmation. An ordinary read-only review request that merely causes implicit skill selection does not grant publication permission. Honor narrower user instructions, existing authorization, repository policies, and read-only/local-only boundaries. Skill creation is never an instruction to run reviews.
 
 Never submit `APPROVE`, merge, deploy, fix PR source, or contact people by email/chat through this workflow. Keep the user's checkout intact. Test notifications with local collectors, not external recipients.
 
@@ -20,9 +22,23 @@ A clean static review is the trigger for live acceptance, not the end of the tas
 - Reuse prior acceptance only under the history rules below and after checking that its saved scenarios, observations and runtime provenance establish the claimed coverage. Missing artifacts or unfinished coverage require execution. Label carried evidence as prior execution, not a fresh test.
 - Always create and link the HTML report for a selected batch, including failures and blockers. Missing inline-display tools change how the report is delivered, not whether the HTML file is generated. A blocked report is an incomplete checkpoint; continue independent work and seek the missing prerequisite.
 
-## Resolve this installation
+## Dependency guard — run before starting
 
-Resolve `SKILL_DIR` from the actual loaded `SKILL.md`, including plugin caches. Read this copy's `references/live-testing.md` and `references/results-format.md` before scheduling acceptance. Resolve dependency skills from their links, then the host's installed skill catalog or the shared repository's category folders. Record the resolved `manual-test-guide` path in the run's coverage notes and scenario-child briefs. If a required dependency is missing, report its name and path and recover it from an available authorized installation; do not silently replace its workflow. Copying only `SKILL.md` is insufficient: this skill requires its bundled scripts, references and report assets.
+On every invocation, tell the user that `review-all` requires companion skills, then verify their availability. Resolve `SKILL_DIR` from the actual loaded `SKILL.md`, including plugin caches. Resolve dependency skills from their links, then the host's installed skill catalog or the shared repository's category folders. Verify each required `SKILL.md` is readable and the referenced resources needed for this run are available; a catalog entry alone does not prove installation is complete.
+
+| Required skill | When required | Usual installed folder |
+| --- | --- | --- |
+| `code-review` | Every batch | `code-review` |
+| `manual-test-guide` | Every batch, including clean reviews | `manual-test-guide` |
+| `github-inline-review` | Batches permitting review publication | `github-inline-review` |
+| `joulemv-code-review` | JouleMV PRs | `joulemv-code-review` |
+| `browser-testing` | Browser acceptance scenarios | `joulemv-browser-testing` (or `browser-testing`) |
+
+Check the known requirements before collecting reviews. If project-specific requirements become known only after collection, check them before reviewing or starting that project's runtime. Summarize the check in one user-facing message with the required names and `available` or `missing`; mark inapplicable dependencies as not needed for this batch. When all required skills are available, proceed without asking for confirmation.
+
+If a required skill is missing or incomplete, name it, show the paths searched and the missing resource, and tell the user to install or copy its **complete folder** into their host's skill directory (`~/.codex/skills` or `~/.claude/skills`, or the configured equivalent). Pause the affected workflow until the dependency is available and the check passes; continue only independent work whose dependencies are satisfied. Do not substitute an improvised review, skip live testing, or treat a dependency failure as a clean result. Resolving an already available copy is allowed; installing or downloading skills requires the user's installation authorization.
+
+Record the resolved dependency paths in the run's coverage notes once the ledger exists, and pass the resolved `manual-test-guide` path to scenario children. Read this copy's `references/live-testing.md` and `references/results-format.md` before scheduling acceptance. Copying only `SKILL.md` is insufficient: `review-all` also requires its bundled scripts, references and report assets.
 
 The workflow must work without the author's saved sessions or helper cache. Use the first-run procedure in `live-testing.md`. When the host lacks subagents, perform the same stages sequentially in the current agent; delegation is an optimization, not an acceptance prerequisite. Apply this host fallback to dependency skills that otherwise assume parallel agents. Outside T3 Code, use the bundled scenario runner subject to the host's browser policy and deliver the standalone HTML. Optional token telemetry must not block testing or report delivery.
 
