@@ -29,6 +29,6 @@ Read values privately for login; keep them out of tool output, reports, and scre
 ## Workflow
 
 1. Use the review workflow's verified target revision and frontend URL. Start the app only when authorized, following its repository configuration or isolated review launcher.
-2. Use T3 Code Navigator as described above to navigate to the target screen.
+2. In T3 Code, use Navigator as described above for interactive checks. For `review-all` scripted scenarios, use its bundled runner under the exception above. On other hosts, follow the host browser policy and the invoking workflow.
 3. Log in with the test credentials above
 4. Verify the screen renders correctly and interactions work as expected
