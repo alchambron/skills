@@ -2,6 +2,14 @@
 
 Read before preparing a runtime for the PR's planned acceptance scenarios. Use the manual guide's scenarios and expected outcomes, then execute them; do not stop at generating a checklist or reaching a login page.
 
+## First run on another machine
+
+Use this installation's bundled `scripts/` and `assets/`, not paths copied from the author's machine. The bundled runtime and scenario helpers require macOS/Linux (or a compatible Unix environment), Python 3, Git and authenticated `gh`; browser scenarios also require Node/npm. Read the target runtime's documented prerequisites and run the JouleMV helper's `doctor` when that profile applies. A missing tool, test database or login is a setup blocker to resolve, not permission to skip acceptance.
+
+Read the resolved `manual-test-guide` skill and its saved scenario plan before execution. An empty helper cache is normal: create the needed helpers from the pinned source and documented local configuration. Reuse only helpers verified against this repository's current contract. Obtain test credentials through the host's secure input flow when documented local configuration provides none; never copy the author's secrets, database, session or private fixture IDs.
+
+Resolve browser policy from the current host. The bundled headless runner is the normal scripted engine for `review-all`, including outside T3 Code where allowed. T3-specific Navigator and inline HTML tools are required only on hosts that expose them, subject to their fallback rules. Missing agent delegation means run runtime preparation and scenarios serially in the current agent, retaining the same receipts and cleanup. Missing inline HTML tools means deliver the standalone generated report.
+
 ## Target runtime
 
 The default is a detached disposable worktree at the exact reviewed PR head, outside the user's checkout. Label all evidence `pr-head-only`. When the user asks for integration testing, build an isolated merge of the pinned base and head; verify both parents. Abort conflicts and report the integration limit rather than resolving them as part of review. A live deployed site is relevant only when its exact revision is verified and its mutation scope is authorized.
@@ -15,9 +23,9 @@ Put scenarios that change shared state in one child and run them in sequence: te
 
 `runtime.json` holds `repository`, `number`, `headSha`, `frontendUrl`, `backendUrl`, `storageState` (the saved session file, mode 0600), `params` for scripts (tenant, fixture IDs), the helpers README path, `worktree`, and `stop`, the exact cleanup command. It holds no credentials. After the PR's scenario children finish, the coordinator runs `stop` and records the cleanup receipt. The coordinator gathers results and owns GitHub publication.
 
-`delegate_task` with `isolation: "worktree"` always attaches a worktree of the coordinator's T3 project and rejects `target.projectId`. For another repository, tell the child to check out the pinned head from the run's bare source (`RUN_DIR/sources/OWNER--REPO.git`) into its own directory under `RUN_DIR` with `git worktree add --detach`, and to remove that worktree at cleanup.
+Use the host's worktree ownership rules for delegated checkouts. Pass the repository and pinned revision through supported delegation options; do not create a child's checkout in the shell when the host owns isolation. When the target repository cannot be delegated with those options, prepare and test it in the current agent using an owned detached checkout, or record the unsupported setup as a blocker.
 
-Reuse saved helpers before writing new ones. Login, database, fixture and polling scripts live in `~/.codex/review-state/review-all/helpers/OWNER/REPO/` across runs, each listed in that directory's `README.md` with one usage line. Read the README and run a helper's `--help`; read its source only to fix it, and fix it in place. A new helper goes there with its README line, so the next PR and the next run call it instead of writing a fresh copy. Script helpers are `.mjs` modules exporting functions that take the runner's `t` (login, open a dialog, read a grid); scenario scripts import them by absolute path. Print only the lines needed from snapshots, logs and API responses; save the full output to a file in the child's result directory.
+Reuse verified saved helpers before writing new ones. Login, database, fixture and polling scripts live in `~/.codex/review-state/review-all/helpers/OWNER/REPO/` across runs, each listed in that directory's `README.md` with one usage line. This is a local cache, not a required preinstalled dependency; create it when absent. Read an existing README and a helper's `--help`, and inspect its source when needed to verify compatibility or fix it. A new helper goes there with its README line, so the next run can reuse it. Script helpers are `.mjs` modules exporting functions that take the runner's `t` (login, open a dialog, read a grid); scenario scripts import them by the current machine's resolved path. Print only the lines needed from snapshots, logs and API responses; save the full output to a file in the child's result directory.
 
 ## Run scenarios as scripts
 
@@ -44,7 +52,7 @@ Choose the target's [project profile](project-profiles.md) before preparing a ru
 
 ```sh
 python3 "$SKILL_DIR/scripts/agent_run.py" doctor
-python3 ~/.codex/skills/respond/scripts/heavy_lock.py --label runtime-start -- \
+python3 "$SKILL_DIR/scripts/heavy_lock.py" --label runtime-start -- \
   python3 "$SKILL_DIR/scripts/agent_run.py" start --schema-mode current
 ```
 
