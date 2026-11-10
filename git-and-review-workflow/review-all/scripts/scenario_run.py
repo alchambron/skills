@@ -28,6 +28,8 @@ import sys
 from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 
+from check_dependencies import require_dependencies
+
 PLAYWRIGHT_VERSION = "1.60.0"
 RUNNER = Path(__file__).resolve().with_name("scenario_runner.mjs")
 EXIT = {"pass": 0, "fail": 1, "error": 2}
@@ -178,6 +180,8 @@ def main(argv=None):
     command.add_argument("--headed", action="store_true")
     command.add_argument("--save-session", help="Save the session to this file (mode 0600) when the run passes")
     args = parser.parse_args(argv)
+    if not require_dependencies():
+        return 2
     try:
         if args.command == "setup":
             print(json.dumps(setup()))

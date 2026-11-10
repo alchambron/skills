@@ -11,6 +11,7 @@ from pathlib import Path
 from urllib.parse import urlencode, urlparse
 
 from project_profiles import project_profile
+from check_dependencies import require_dependencies
 
 
 COMPONENT = re.compile(r"[A-Za-z0-9_.-]+\Z")
@@ -395,6 +396,8 @@ def main(argv=None):
     parser.add_argument("--host", default="github.com")
     parser.add_argument("--selection", type=Path, help="history.py selection file; collect only its selected PRs")
     args = parser.parse_args(argv)
+    if not require_dependencies():
+        return 2
     try:
         for repository in args.repo:
             repository_parts(repository)

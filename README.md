@@ -28,6 +28,31 @@ The category folders organize this repository. Each nested folder containing `SK
 
 These are copies of the local skills. Editing this repository does not update the installed copies automatically. The collection covers personal skills installed directly under `~/.codex/skills`, `~/.agents/skills`, and `~/.claude/skills`; built-in system skills and plugin-managed bundles are excluded.
 
+## Install or update review-all
+
+Install the complete folders below into your agent's personal skills directory (`~/.codex/skills` for Codex or `~/.claude/skills` for Claude Code). Refresh the whole installed folder when updating, including scripts, references and assets; copying only `SKILL.md` leaves the runner and report generator behind. Keep a backup of any local customizations. Start a new agent session after updating and confirm it loads the intended `review-all/SKILL.md`, rather than an older project or plugin copy.
+
+| Repository folder | Installed folder |
+| --- | --- |
+| `git-and-review-workflow/review-all` | `review-all` |
+| `git-and-review-workflow/code-review` | `code-review` |
+| `git-and-review-workflow/joulemv-code-review` | `joulemv-code-review` |
+| `git-and-review-workflow/github-inline-review` | `github-inline-review` |
+| `testing-and-quality/manual-test-guide` | `manual-test-guide` |
+| `testing-and-quality/browser-testing` | `joulemv-browser-testing` |
+
+The repository uses category-relative dependency links; flattened installations resolve those dependencies through the installed skill catalog as described in `review-all`. The browser skill's declared name is `browser-testing`; its installed folder above matches the sibling links used by existing personal skills. Remove or disable an obsolete `joulemv-review-all` entry only after confirming the new installation, so invocations cannot select the old workflow accidentally.
+
+The full workflow requires all five companion skills above. Each of these six folders has a canonical `VERSION` file in `X.Y.Z` format, initially `1.0.0`. `review-all/requirements.json` declares the compatible companion versions with an inclusive minimum and exclusive upper bound. Its dependency checker runs before batch work; a missing or invalid `VERSION`, an incompatible companion version, or missing required files stops the batch with the installed and required versions and update links. Copy each updated folder as a unit, including its `VERSION`; changing a version number alone does not update older code.
+
+At startup, `review-all` also checks this repository's [`skill-versions.json`](skill-versions.json) on `main` through authenticated `gh` access. It recommends available newer releases without installing them or blocking a locally compatible batch. When the network, authentication or catalog is unavailable, it reports that the latest versions are unknown and still enforces local compatibility. Legacy copies cannot notify you about this mechanism until you update `review-all` once.
+
+Invoke `/review-all` in Claude Code or `$review-all` in Codex. Clean reviews must proceed through `manual-test-guide`, execution of the planned live scenarios, and an illustrated HTML report. T3 Code displays that report inline; other hosts receive the generated `scenario-guide.html` file. No separate request to run tests is needed. Missing runtime prerequisites remain explicit blockers, and token telemetry is optional outside Codex. Test databases, credentials and saved login sessions are machine-local prerequisites; they are not distributed with the skills.
+
+### Maintaining versions
+
+For each changed versioned skill, bump its `VERSION`: patch for a fix, minor for a compatible addition, major for an incompatible change. Update its latest version in [`skill-versions.json`](skill-versions.json), and adjust the relevant dependency ranges in [`review-all/requirements.json`](git-and-review-workflow/review-all/requirements.json) when required contracts change. Release the version file with the corresponding complete skill folder. Versions declare releases and compatibility; they are not integrity hashes.
+
 ## Multi-agent setup for Codex
 
 From this repository, install the two skills in your personal Codex skills directory:
@@ -72,6 +97,6 @@ For Claude Code, link the same skill into `~/.claude/skills/pr-classify` and add
 
 ## Import notes
 
-The descriptions in `dropdown-utils` and `figma-import` were quoted to fix YAML parsing without changing their wording. The `review-all` repository copy uses category-relative links for its testing dependencies; its installed copy uses sibling skill links. The `respond` fixer reference uses a category-relative link to browser-testing; the installed copy uses a sibling skill link. `respond-all` calls `respond`'s scripts through their installed `~/.codex/skills` paths; `review-all` and the `respond` fixer run builds and runtime starts through the installed `respond/scripts/heavy_lock.py` the same way. `review-all`'s scenario runner installs pinned Playwright 1.60.0 and its headless Chromium shell into `~/.codex/review-state/review-all/tools/playwright` (about 210 MB) on first use; per-repository test helpers live outside the repository in `~/.codex/review-state/review-all/helpers`. The installed `joulemv-browser-testing` allows that runner as `review-all`'s scenario engine; the repository's `browser-testing` predates that rule. Other imported files preserve their source content at the time of import. Installed copies may have changed since. The newly imported skills retain their installed sibling links and external prerequisites: the `joulemv-browser-testing` dependency, the shared Sentry wrapper, the separate `cc-context-awareness` installation, and existing security-watch templates, inventory, and browser installation. These external resources are not bundled.
+The descriptions in `dropdown-utils` and `figma-import` were quoted to fix YAML parsing without changing their wording. The `review-all` repository copy uses category-relative links for its testing dependencies; its installed copy uses sibling skill links. The `respond` fixer reference uses a category-relative link to browser-testing; the installed copy uses a sibling skill link. `respond-all` calls `respond`'s scripts through their installed `~/.codex/skills` paths. `review-all` bundles its runtime lock helper and shares the same machine-wide lock directory with `respond`. `review-all`'s scenario runner installs pinned Playwright 1.60.0 and its headless Chromium shell into `~/.codex/review-state/review-all/tools/playwright` (about 210 MB) on first use; per-repository test helpers live outside the repository in `~/.codex/review-state/review-all/helpers`. The repository's `browser-testing` includes the same Navigator and scripted-runner contract as the installed `joulemv-browser-testing`. Other imported files preserve their source content at the time of import. Installed copies may have changed since. The newly imported skills retain their installed sibling links and external prerequisites: the shared Sentry wrapper, the separate `cc-context-awareness` installation, and existing security-watch templates, inventory, and browser installation. These external resources are not bundled.
 
 All 56 skill frontmatter blocks parse as YAML. Imported source metadata is retained.

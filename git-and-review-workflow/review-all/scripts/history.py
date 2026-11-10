@@ -21,6 +21,7 @@ import secrets
 import sys
 
 from collect_reviews import CollectionError, GitHub, candidate_identity, repository_parts, search_requests
+from check_dependencies import require_dependencies
 
 NOTHING_NEW = 10
 DONE_REVIEW = {"clean", "issues"}
@@ -248,6 +249,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         if args.command == "select":
+            if not require_dependencies():
+                return 2
             for repository in args.repo:
                 repository_parts(repository)
             with locked() as directory:

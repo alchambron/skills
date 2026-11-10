@@ -753,6 +753,16 @@ def main():
     watch_parser = sub.add_parser("_watchdog", help=argparse.SUPPRESS)
     watch_parser.add_argument("run_id")
     args = parser.parse_args()
+    if args.command == "start":
+        try:
+            from check_dependencies import require_dependencies
+        except ImportError:
+            output(ok=False, status="installation_required", message="review-all did not start. Install the complete "
+                   "[review-all folder](https://github.com/alchambron/skills/tree/main/git-and-review-workflow/review-all) "
+                   "before retrying; its dependency checker is unavailable.")
+            return 2
+        if not require_dependencies():
+            return 2
     try:
         if args.command == "doctor":
             _, _, _, _, size = preflight()
