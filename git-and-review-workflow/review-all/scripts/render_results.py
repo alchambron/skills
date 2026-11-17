@@ -139,7 +139,7 @@ def live_evidence_gaps(pr):
     heads = {str(pr.get("head_sha", "")).lower()}
     pin_sets = [{str(pr.get(key, "")).lower() for key in ("base_sha", "head_sha")}]
     # Carry mode: the head only added documentation, so evidence from the code-identical head still applies.
-    carried = live.get("carried_from") if (pr.get("review_basis") or {}).get("mode") == "carry" else None
+    carried = live.get("carried_from") if (pr.get("review_basis") or {}).get("mode") in ("carry", "decision") else None
     if isinstance(carried, dict) and full_sha(carried.get("head_sha")):
         heads.add(carried["head_sha"].lower())
         if full_sha(carried.get("base_sha")):
@@ -191,6 +191,8 @@ def next_actions(pr):
         add("testing", "Complete planned checks and evidence")
     if pr.get("pending_cleanup") or pr["live"].get("cleanup_status") == "pending":
         add("cleanup", "Verify owned resource cleanup")
+    if pr.get("review_request", {}).get("status") == "requested":
+        add("decision", "Your review decision is still requested")
     if not actions:
         add("complete", "Recorded review and check scope complete; not approval")
     return actions

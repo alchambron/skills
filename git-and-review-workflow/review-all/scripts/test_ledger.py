@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from collect_reviews import CollectionError
 from ledger import carry, initialize, record, resume, save
+from render_results import prepare
 from test_render_results import ledger, scenario
 
 
@@ -70,6 +71,21 @@ class LedgerTests(unittest.TestCase):
         self.assertNotIn("current_head_sha", result["prs"][0])
         with self.assertRaises(FileExistsError):
             initialize(snapshot_path, target)
+
+    def test_resume_refreshes_outstanding_user_request_separately_from_analysis(self):
+        data = self.load()
+        data["login"] = "Reviewer"
+        save(self.path, data)
+        api = FakeGitHub()
+        api.metadata["requested_reviewers"] = [{"login": "reviewer"}]
+        result = resume(self.path, api)["prs"][0]
+        self.assertEqual(result["review_request"]["status"], "requested")
+        api.metadata["requested_reviewers"] = []
+        result = resume(self.path, api)["prs"][0]
+        self.assertEqual(result["review_request"]["status"], "not_requested")
+        del api.metadata["requested_reviewers"]
+        result = resume(self.path, api)["prs"][0]
+        self.assertEqual(result["review_request"]["status"], "unknown")
 
     def test_record_checks_revision_and_validation_before_replacement(self):
         original = self.path.read_bytes()
@@ -311,6 +327,70 @@ class CarryTests(unittest.TestCase):
         self.assertEqual(result["carried"], [])
         self.assertIn("no finished review", result["skipped"][0]["reason"])
         self.assertEqual(json.loads(self.path.read_text())["prs"][0]["review"]["status"], "pending")
+
+    def test_decision_mode_reuses_exact_revision_and_preserves_failed_acceptance(self):
+        data = json.loads(self.path.read_text())
+        item = data["prs"][0]
+        item["head_sha"] = "b" * 40
+        item["review_basis"]["mode"] = "decision"
+        save(self.path, data)
+        result = carry(self.path)
+        self.assertEqual(len(result["carried"]), 1)
+        pr = json.loads(self.path.read_text())["prs"][0]
+        self.assertEqual(pr["publication"]["status"], "reused")
+        self.assertEqual(pr["publication"]["new_reviews"], 0)
+        self.assertEqual(pr["scenarios"][0]["status"], "fail")
+        self.assertIn("same base/head", pr["review"]["limits"][-1])
+
+    def test_decision_mode_refuses_changed_base_head_or_unfinished_live_evidence(self):
+        for field, value in (("base_sha", "d" * 40), ("head_sha", "c" * 40), ("live", {"status": "blocked"})):
+            with self.subTest(field=field):
+                data = json.loads(self.path.read_text())
+                item = data["prs"][0]
+                item["head_sha"] = "b" * 40
+                item["review_basis"]["mode"] = "decision"
+                earlier_path = self.root / "earlier/results.json"
+                original = earlier_path.read_bytes()
+                earlier = json.loads(original)
+                earlier["prs"][0][field] = value
+                save(earlier_path, earlier)
+                save(self.path, data)
+                try:
+                    self.assertEqual(carry(self.path)["carried"], [])
+                    self.assertEqual(json.loads(self.path.read_text())["prs"][0]["review"]["status"], "pending")
+                finally:
+                    earlier_path.write_bytes(original)
+
+    def test_decision_after_documentation_carry_keeps_original_tested_revision(self):
+        earlier_path = self.root / "earlier/results.json"
+        earlier = json.loads(earlier_path.read_text())
+        earlier["prs"][0].update(review={"status": "clean"}, publication={"status": "not_required"},
+                                  scenarios=[scenario(status="pass")])
+        save(earlier_path, earlier)
+        carry(self.path)
+        documented = json.loads(self.path.read_text())
+        documented["prs"][0].update(current_base_sha="a" * 40, current_head_sha="c" * 40)
+        prior = self.root / "documented"
+        prior.mkdir()
+        save(prior / "results.json", documented)
+        next_run = copy.deepcopy(documented)
+        item = next_run["prs"][0]
+        item.update(review_basis={"mode": "decision", "fromHead": "c" * 40, "fromBase": "a" * 40,
+                                  "previousRun": str(prior)}, review={"status": "pending"},
+                    publication={"status": "pending"}, live={"status": "pending"}, scenarios=[],
+                    review_request={"status": "requested"})
+        save(self.path, next_run)
+        self.assertEqual(len(carry(self.path)["carried"]), 1)
+        result = json.loads(self.path.read_text())
+        result["prs"][0].update(current_base_sha="a" * 40, current_head_sha="c" * 40)
+        self.assertEqual(result["prs"][0]["live"]["carried_from"]["head_sha"], "b" * 40)
+        self.assertEqual(result["prs"][0]["live"]["reused_from"]["head_sha"], "c" * 40)
+        output = self.root / "report"
+        output.mkdir()
+        rendered = prepare(result, self.root, output)["prs"][0]
+        self.assertEqual(rendered["live"]["display_status"], "complete")
+        self.assertEqual(rendered["scenarios"][0]["display_status"], "pass")
+        self.assertEqual([action["kind"] for action in rendered["next_actions"]], ["decision"])
 
 
 if __name__ == "__main__":

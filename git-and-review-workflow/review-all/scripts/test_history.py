@@ -59,11 +59,29 @@ class HistoryTests(unittest.TestCase):
             api.responses[f"repos/EnerZam/JouleMV/pulls/{value['number']}"] = value
         return api
 
-    def test_complete_pr_at_same_head_is_skipped_and_new_pr_selected(self):
-        self.state({"EnerZam/JouleMV#10": {"reviewedHead": HEAD, "complete": True, "outcome": "clean"}})
+    def test_complete_pr_still_requested_is_included_without_repeating_analysis(self):
+        self.state({"EnerZam/JouleMV#10": {"reviewedHead": HEAD, "reviewedBase": BASE, "complete": True,
+                                           "outcome": "clean", "runDir": "/runs/earlier"}})
         result = self.select(self.api([pull(10), pull(11)]))
-        self.assertEqual([c["key"] for c in result["selected"]], ["EnerZam/JouleMV#11"])
-        self.assertEqual(result["skipped"][0]["reason"], "unchanged")
+        self.assertEqual([c["key"] for c in result["selected"]], ["EnerZam/JouleMV#10", "EnerZam/JouleMV#11"])
+        self.assertEqual(result["selected"][0]["basis"], {"mode": "decision", "fromHead": HEAD,
+                                                          "fromBase": BASE, "previousRun": "/runs/earlier"})
+        self.assertEqual(result["skipped"], [])
+
+    def test_same_head_with_changed_or_missing_base_requires_full_review(self):
+        for base in (NEW_HEAD, None):
+            with self.subTest(base=base):
+                self.state({"EnerZam/JouleMV#10": {"reviewedHead": HEAD, "reviewedBase": base,
+                                                   "complete": True, "outcome": "clean"}})
+                item = self.select(self.api([pull(10)]))["selected"][0]
+                self.assertEqual((item["kind"], item["basis"]["mode"]), ("moved", "full"))
+
+    def test_completed_pr_leaves_decision_queue_when_request_clears(self):
+        self.state({"EnerZam/JouleMV#10": {"reviewedHead": HEAD, "reviewedBase": BASE,
+                                           "complete": True, "outcome": "clean"}})
+        result = self.select(self.api([pull(10, requested=())]))
+        self.assertEqual(result["selected"], [])
+        self.assertEqual(result["skipped"][0]["reason"], "request_no_longer_current")
 
     def test_moved_head_is_incremental_and_listed_first(self):
         self.state({"EnerZam/JouleMV#10": {"reviewedHead": HEAD, "reviewedBase": BASE, "complete": True,
@@ -106,28 +124,53 @@ class HistoryTests(unittest.TestCase):
         self.assertTrue(any("compare" in warning for warning in result["warnings"]))
 
     def test_rerequest_only_after_a_submitted_request_changes(self):
-        self.state({"EnerZam/JouleMV#10": {"reviewedHead": HEAD, "complete": True, "outcome": "issues",
+        self.state({"EnerZam/JouleMV#10": {"reviewedHead": HEAD, "reviewedBase": BASE, "complete": True, "outcome": "issues",
                                            "publication": "verified"},
-                    "EnerZam/JouleMV#11": {"reviewedHead": HEAD, "complete": True, "outcome": "issues",
+                    "EnerZam/JouleMV#11": {"reviewedHead": HEAD, "reviewedBase": BASE, "complete": True, "outcome": "issues",
                                            "publication": "reused"}})
         result = self.select(self.api([pull(10), pull(11)]))
-        self.assertEqual([(c["key"], c["kind"]) for c in result["selected"]], [("EnerZam/JouleMV#10", "rerequested")])
-        self.assertEqual(result["skipped"][0]["reason"], "unchanged")
+        self.assertEqual([(c["key"], c["kind"]) for c in result["selected"]],
+                         [("EnerZam/JouleMV#10", "rerequested"), ("EnerZam/JouleMV#11", "awaiting_decision")])
 
     def test_incomplete_attempt_is_retried(self):
-        self.state({"EnerZam/JouleMV#10": {"reviewedHead": HEAD, "complete": False, "outcome": "clean"}})
+        self.state({"EnerZam/JouleMV#10": {"reviewedHead": HEAD, "reviewedBase": BASE, "complete": False, "outcome": "clean"}})
         self.assertEqual(self.select(self.api([pull(10)]))["selected"][0]["kind"], "retry")
 
     def test_unfinished_live_test_resumes_after_request_cleared(self):
-        self.state({"EnerZam/JouleMV#10": {"reviewedHead": HEAD, "complete": False, "outcome": "issues",
+        self.state({"EnerZam/JouleMV#10": {"reviewedHead": HEAD, "reviewedBase": BASE, "complete": False, "outcome": "issues",
                                            "liveStatus": "pending"},
-                    "EnerZam/JouleMV#12": {"reviewedHead": HEAD, "complete": False, "outcome": "issues",
+                    "EnerZam/JouleMV#12": {"reviewedHead": HEAD, "reviewedBase": BASE, "complete": False, "outcome": "issues",
                                            "liveStatus": "blocked"}})
         api = self.api([])
         api.responses["repos/EnerZam/JouleMV/pulls/10"] = pull(10, requested=())
         api.responses["repos/EnerZam/JouleMV/pulls/12"] = pull(12, requested=())
         result = self.select(api)
-        self.assertEqual([(c["key"], c["basis"]["stage"]) for c in result["selected"]], [("EnerZam/JouleMV#10", "live")])
+        self.assertEqual([(c["key"], c["basis"]["stage"]) for c in result["selected"]],
+                         [("EnerZam/JouleMV#10", "live"), ("EnerZam/JouleMV#12", "live")])
+
+    def test_unfinished_history_obeys_explicit_repository_scope(self):
+        self.state({"EnerZam/JouleMV#10": {"reviewedHead": HEAD, "complete": False, "liveStatus": "blocked"}})
+        api = self.api([])
+        with history.locked() as directory:
+            state = history.read_state(directory)
+        result = history.select(api, state, ["Other/Repository"], False, self.root / "scoped")
+        self.assertEqual(result["selected"], [])
+        self.assertFalse(any(endpoint == "repos/EnerZam/JouleMV/pulls/10" for endpoint, _ in api.calls))
+
+    def test_cleared_request_with_unfinished_work_revalidates_a_changed_base(self):
+        self.state({"EnerZam/JouleMV#10": {"reviewedHead": HEAD, "reviewedBase": NEW_HEAD,
+                                           "complete": False, "liveStatus": "blocked"}})
+        api = self.api([])
+        api.responses["repos/EnerZam/JouleMV/pulls/10"] = pull(10, requested=())
+        self.assertEqual(self.select(api)["selected"][0]["basis"]["mode"], "full")
+
+    def test_changed_base_also_invalidates_discussion_and_documentation_carry(self):
+        for head in (HEAD, NEW_HEAD):
+            with self.subTest(head=head):
+                self.state({"EnerZam/JouleMV#10": {"reviewedHead": HEAD, "reviewedBase": NEW_HEAD,
+                                                   "complete": True, "outcome": "issues", "publication": "verified"}})
+                item = self.select(self.api([pull(10, head=head)]))["selected"][0]
+                self.assertEqual(item["basis"]["mode"], "full")
 
     def test_drafts_and_stale_requests_are_skipped(self):
         result = self.select(self.api([pull(10, draft=True), pull(11, requested=())]))
@@ -139,13 +182,18 @@ class HistoryTests(unittest.TestCase):
         result = self.select(self.api([pull(10)]), force=True)
         self.assertEqual(result["selected"][0]["basis"], {"mode": "full"})
 
-    def test_select_cli_reports_nothing_new(self):
-        self.state({"EnerZam/JouleMV#10": {"reviewedHead": HEAD, "complete": True, "outcome": "clean"}})
+    def test_select_cli_keeps_completed_request_visible(self):
+        self.state({"EnerZam/JouleMV#10": {"reviewedHead": HEAD, "reviewedBase": BASE, "complete": True, "outcome": "clean"}})
         with patch.object(history, "GitHub", return_value=self.api([pull(10)])), \
                 contextlib.redirect_stdout(io.StringIO()) as out:
-            self.assertEqual(history.main(["select"]), history.NOTHING_NEW)
+            self.assertEqual(history.main(["select"]), 0)
         printed = json.loads(out.getvalue())
-        self.assertEqual((printed["selected"], printed["skipped"]), ([], {"EnerZam/JouleMV#10": "unchanged"}))
+        self.assertEqual((printed["selected"], printed["skipped"]), (["EnerZam/JouleMV#10 awaiting_decision"], {}))
+
+    def test_select_cli_reports_nothing_when_no_request_remains(self):
+        with patch.object(history, "GitHub", return_value=self.api([])), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(history.main(["select"]), history.NOTHING_NEW)
 
     def write_results(self, prs):
         run = self.root / "run"

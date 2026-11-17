@@ -436,6 +436,15 @@ class ReportTests(unittest.TestCase):
         self.assertEqual([a["kind"] for a in pr["next_actions"]], ["complete"])
         self.assertIn("not approval", pr["next_actions"][0]["label"])
 
+    def test_completed_analysis_still_exposes_the_users_outstanding_decision(self):
+        data = ledger()
+        data["prs"][0]["review_request"] = {"status": "requested"}
+        pr = self.prepare(data)["prs"][0]
+        self.assertEqual(pr["scenarios"][0]["display_status"], "pass")
+        self.assertEqual([action["kind"] for action in pr["next_actions"]], ["decision"])
+        data["prs"][0]["review_request"]["status"] = "not_requested"
+        self.assertEqual([action["kind"] for action in self.prepare(data)["prs"][0]["next_actions"]], ["complete"])
+
     def test_copy_evidence_and_missing_evidence_remain_explicit(self):
         image = self.source / "inspected.png"
         image.write_bytes(b"\x89PNG\r\n\x1a\n")

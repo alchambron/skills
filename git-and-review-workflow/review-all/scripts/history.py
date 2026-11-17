@@ -27,7 +27,7 @@ NOTHING_NEW = 10
 DONE_REVIEW = {"clean", "issues"}
 DONE_PUBLICATION = {"verified", "reused", "not_required", "not_requested"}
 DONE_LIVE = {"complete", "not_required"}
-PRIORITY = {"moved": 0, "rerequested": 0, "retry": 1, "new": 2}
+PRIORITY = {"moved": 0, "rerequested": 0, "retry": 1, "awaiting_decision": 2, "new": 3}
 # A moved head whose new commits touch only these paths runs the code already reviewed and tested.
 DOC_SUFFIXES = (".md", ".mdx", ".rst", ".adoc")
 RUNTIME_DIRS = {"src", "public", "static", "assets", "resources", "templates"}
@@ -76,7 +76,7 @@ def key_of(repository, number):
 
 
 def classify(entry, head, force):
-    """Return (kind, basis); kind is new/moved/rerequested/retry/unchanged (no basis = skip)."""
+    """Classify a current direct review request separately from completed agent work."""
     if force or not entry or not entry.get("reviewedHead"):
         return "new", {"mode": "full"}
     if entry["reviewedHead"] != head:
@@ -87,7 +87,9 @@ def classify(entry, head, force):
         # Our submitted Request changes cleared the request; a current request means the author asked again.
         return "rerequested", {"mode": "discussion", "previousOutcome": "issues", "previousRun": entry.get("runDir")}
     if entry.get("complete"):
-        return "unchanged", None
+        return "awaiting_decision", {"mode": "decision", "fromHead": head,
+                                     "fromBase": entry.get("reviewedBase"),
+                                     "previousRun": entry.get("runDir")}
     return "retry", {"mode": "retry", "previousOutcome": entry.get("outcome"), "previousRun": entry.get("runDir")}
 
 
@@ -159,19 +161,24 @@ def select(api, state, repositories, force, scratch):
             continue
         entry = state["prs"].get(item["key"])
         kind, basis = classify(entry, head, force)
+        if not force and entry and entry.get("reviewedHead") and entry.get("reviewedBase") != base:
+            kind, basis = "moved", {"mode": "full", "previousRun": entry.get("runDir"),
+                                    "reason": "base_changed_or_unrecorded"}
         if basis is None:
             skipped.append({**item, "reason": kind})
             continue
-        if kind == "moved":
+        if kind == "moved" and basis.get("mode") == "incremental":
             basis = carry_basis(api, name, entry, head, basis, warnings)
         candidates.append({**item, "kind": kind, "basis": basis})
     seen = {c["key"] for c in candidates} | {s["key"] for s in skipped}
     # Publishing Request changes clears the request, so an unfinished live test is resumed from history.
     for key, entry in state["prs"].items():
-        if (force or key in seen or entry.get("closed") or entry.get("complete") or not entry.get("reviewedHead")
-                or entry.get("liveStatus") not in (None, "pending")):
-            continue
         name, _, number = key.rpartition("#")
+        if repositories and name.casefold() not in {repository.casefold() for repository in repositories}:
+            continue
+        if (force or key in seen or entry.get("closed") or entry.get("complete") or not entry.get("reviewedHead")
+                or entry.get("liveStatus") in DONE_LIVE):
+            continue
         try:
             repository_parts(name)
             pr = api.get(f"repos/{name}/pulls/{int(number)}")
@@ -181,11 +188,15 @@ def select(api, state, repositories, force, scratch):
             continue
         if pr.get("state") != "open" or pr.get("draft") or head != entry["reviewedHead"]:
             continue
+        kind, basis = "retry", {"mode": "retry", "stage": "live", "previousOutcome": entry.get("outcome"),
+                                "previousRun": entry.get("runDir")}
+        if entry.get("reviewedBase") != pr["base"]["sha"]:
+            kind, basis = "moved", {"mode": "full", "previousRun": entry.get("runDir"),
+                                    "reason": "base_changed_or_unrecorded"}
         candidates.append({"key": key, "url": pr.get("html_url") or entry.get("url"), "repository": name,
                            "number": int(number), "head": head, "base": pr["base"]["sha"], "title": pr.get("title"),
-                           "updatedAt": pr.get("updated_at"), "createdAt": pr.get("created_at"), "kind": "retry",
-                           "basis": {"mode": "retry", "stage": "live", "previousOutcome": entry.get("outcome"),
-                                     "previousRun": entry.get("runDir")}})
+                           "updatedAt": pr.get("updated_at"), "createdAt": pr.get("created_at"), "kind": kind,
+                           "basis": basis})
     candidates.sort(key=lambda c: (PRIORITY[c["kind"]], c.get("updatedAt") if c["kind"] != "new" else c.get("createdAt") or ""))
     return {"login": login, "searchComplete": complete, "warnings": warnings,
             "selected": candidates, "skipped": skipped}
