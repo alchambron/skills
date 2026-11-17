@@ -76,6 +76,14 @@ def blank_stages(pr):
     pr["scenarios"] = []
 
 
+def review_request(pr, login, reviewers):
+    """A live direct request remains actionable even after agent analysis is complete."""
+    users = {user.casefold() for user in reviewers if isinstance(user, str)} if isinstance(reviewers, list) else None
+    pr["review_request"] = {"status": "unknown" if users is None or not login else
+                            "requested" if login.casefold() in users else "not_requested",
+                            "checked_at": now(), "head_sha": pr.get("head_sha")}
+
+
 def initialize(snapshot_path, output):
     snapshot = json.loads(Path(snapshot_path).read_text(encoding="utf-8"))
     data = {key: copy.deepcopy(snapshot[key]) for key in ("version", "login", "collected_at")}
@@ -97,6 +105,7 @@ def initialize(snapshot_path, output):
                 pr[key] = copy.deepcopy(candidate[key])
         pr["coverage_gaps"] = list(candidate.get("coverage", {}).get("warnings", []))
         blank_stages(pr)
+        review_request(pr, data.get("login"), candidate.get("requested_reviewers"))
         if candidate.get("draft") or candidate.get("collection_status") == "failed":
             pr["review"]["status"] = "blocked"
             pr["coverage_gaps"].append("Draft or unavailable collection; inspect snapshot before reviewing")
@@ -272,6 +281,8 @@ def resume(path, api=None, host=None):
                 pr["current_head_sha"] = final["head"]["sha"]
                 pr["refreshed_at"] = now()
                 pr["pr_state"] = final["state"]
+                review_request(pr, data.get("login"), [user.get("login") for user in final["requested_reviewers"]]
+                               if isinstance(final.get("requested_reviewers"), list) else None)
                 if final["state"] != "open":
                     pr["review"] = {**pr["review"], "status": "blocked"}
                     if "PR is closed; no further review publication" not in pr["coverage_gaps"]:
@@ -303,13 +314,13 @@ def previous_outcome(previous, pr, from_head):
 
 
 def carry(path):
-    """Copy outcomes for PRs whose `review_basis.mode` is carry from the run that reviewed the same code."""
+    """Reuse code-identical evidence, including unchanged PRs awaiting a user decision."""
     carried, skipped = [], []
     with locked(path) as target:
         data = read(target)
         for pr in data["prs"]:
             basis = pr.get("review_basis") or {}
-            if basis.get("mode") != "carry":
+            if basis.get("mode") not in ("carry", "decision"):
                 continue
             label = f"{pr['repository']}#{pr['number']}"
             if pr["review"]["status"] != "pending" or pr["scenarios"]:
@@ -324,21 +335,35 @@ def carry(path):
             if source is None or source.get("review", {}).get("status") not in ("clean", "issues"):
                 skipped.append({"pr": label, "reason": f"no finished review at {basis.get('fromHead')} in {source_path}"})
                 continue
+            decision = basis.get("mode") == "decision"
+            if decision and (source.get("base_sha") != pr["base_sha"] or source.get("head_sha") != pr["head_sha"]
+                             or source.get("live", {}).get("status") not in ("complete", "not_required")
+                             or source.get("publication", {}).get("status") not in ("verified", "reused", "not_required", "not_requested")):
+                skipped.append({"pr": label, "reason": "decision reuse requires completed evidence at the exact base and head"})
+                continue
             files = basis.get("changedFiles", [])
             origin = {"run": str(source_path.parent), "head_sha": basis["fromHead"], "base_sha": source.get("base_sha"),
                       "changed_files": files}
-            note = (f"Carried from {origin['run']} at {basis['fromHead'][:12]}: the new commits change only "
+            note = (f"Prior execution from {origin['run']} at the same base/head; your review decision is still requested"
+                    if decision else f"Carried from {origin['run']} at {basis['fromHead'][:12]}: the new commits change only "
                     f"documentation ({', '.join(files[:5])}{', ...' if len(files) > 5 else ''})")
             pr["review"] = copy.deepcopy(source["review"])
             pr["review"]["limits"] = pr["review"].get("limits", []) + [note]
             publication = copy.deepcopy(source.get("publication") or {"status": "pending"})
-            if publication.get("status") in ("not_required", "not_requested"):
+            if decision and publication.get("status") in ("verified", "reused"):
+                pr["publication"] = {"status": "reused", "review_url": publication.get("review_url"),
+                                     "reused_threads": publication.get("reused_threads", []),
+                                     "carried_from": publication, "new_reviews": 0}
+            elif publication.get("status") in ("not_required", "not_requested"):
                 pr["publication"] = publication
             else:
                 # Existing threads still apply to identical code; reuse them through the publishing skill's readback.
                 pr["publication"] = {"status": "pending", "carried_from": publication}
-            pr["live"] = {**copy.deepcopy(source.get("live") or {"status": "pending"}), "carried_from": origin}
-            pr["scenarios"] = [{**copy.deepcopy(item), "carried_from": {"run": origin["run"], "head_sha": origin["head_sha"]}}
+            pr["live"] = {**copy.deepcopy(source.get("live") or {"status": "pending"}),
+                          "carried_from": copy.deepcopy(source.get("live", {}).get("carried_from") or origin),
+                          "reused_from": origin}
+            pr["scenarios"] = [{**copy.deepcopy(item), "carried_from": copy.deepcopy(item.get("carried_from") or
+                                {"run": origin["run"], "head_sha": origin["head_sha"]}), "reused_from": origin}
                                for item in source.get("scenarios", [])]
             if source.get("runtime_provenance"):
                 pr["runtime_provenance"] = copy.deepcopy(source["runtime_provenance"])
