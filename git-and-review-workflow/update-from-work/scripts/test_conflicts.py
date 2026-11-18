@@ -19,6 +19,7 @@ class ConflictReports(unittest.TestCase):
         self.assertEqual(report['resolutions'][0]['command'], 'npm run generate')
         self.assertEqual(report['verification'][0]['result'], 'passed')
         self.assertEqual(report['abort_reason'], '')
+        self.assertEqual(report['conflicted_files'], ['docs/feature-map/index.json'])
 
     def test_all_supported_methods(self):
         for method in ('kept ours', 'kept theirs', 'combined'):
@@ -42,6 +43,39 @@ class ConflictReports(unittest.TestCase):
             self.assertIn('npm test', report['abort_reason'])
             self.assertEqual(report['verification'][0]['reason'], 'Dependency missing')
 
-    def test_optional_unavailable_check_needs_reason(self):
-        self.assertEqual(self.report(verification=[dict(command='lint docs', result='inapplicable',
-            essential=False, reason='No documentation linter', evidence='commands.log')])['decision'], 'push')
+    def test_optional_skipped_check_needs_reason(self):
+        passed = dict(command='npm test', result='passed', evidence='tests.log')
+        optional = dict(command='lint docs', result='inapplicable', essential=False,
+                        reason='No documentation linter', evidence='commands.log')
+        self.assertEqual(self.report(verification=[passed, optional])['decision'], 'push')
+        self.assertEqual(self.report(verification=[passed, dict(optional, reason='')])['decision'],
+                         'abort')
+
+    def test_only_nonessential_skipped_checks_abort(self):
+        report = self.report(verification=[dict(command='lint docs', result='inapplicable',
+            essential=False, reason='No documentation linter', evidence='commands.log')])
+        self.assertEqual(report['decision'], 'abort')
+        self.assertIn('Missing passed essential verification', report['abort_reason'])
+
+    def test_passed_nonessential_check_alone_aborts(self):
+        report = self.report(verification=[dict(command='lint docs', result='passed',
+            essential=False, evidence='commands.log')])
+        self.assertEqual(report['decision'], 'abort')
+
+    def test_report_keeps_original_conflicts_on_early_abort(self):
+        files = ['db/migrate/2026_add.rb', 'package.json']
+        report = resolution_report(1600, files, [], [],
+                                   abort_reason='Incompatible migration ordering')
+        self.assertEqual(report['decision'], 'abort')
+        self.assertEqual(report['conflicted_files'], files)
+        self.assertEqual(report['resolutions'], [])
+        self.assertEqual(report['verification'], [])
+        self.assertTrue(report['abort_reason'].startswith('Incompatible migration ordering'))
+        self.assertEqual(set(report), {'number', 'decision', 'conflicted_files', 'resolutions',
+                                       'verification', 'abort_reason'})
+        files.append('mutated')
+        self.assertEqual(len(report['conflicted_files']), 2)
+
+
+if __name__ == '__main__':
+    unittest.main()
