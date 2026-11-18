@@ -8,8 +8,17 @@ def push_allowed(pr, original, current, contains_original):
             and bool(original) and original == current and contains_original)
 
 
-def ci_state(checks, required):
-    """Input is normalized newest-attempt evidence, not raw GitHub responses."""
+def ci_state(checks, required, events=None):
+    """Judge normalized newest-attempt CI evidence.
+
+    events maps check identities to their verified Actions triggering event.
+    Omitted/unknown provenance retains the existing fail-closed behavior.
+    Non-push evidence must never overwrite push evidence during normalization.
+    """
+    if events is not None:
+        checks = {name: value for name, value in checks.items()
+                  if events.get(name) not in {'schedule', 'workflow_dispatch',
+                                              'repository_dispatch'}}
     if not checks or not set(required).issubset(checks):
         return 'unknown'
     if any(value == 'red' for value in checks.values()):
