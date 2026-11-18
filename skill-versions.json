@@ -24,6 +24,10 @@
     "browser-testing": {
       "version": "1.0.0",
       "path": "testing-and-quality/browser-testing"
+    },
+    "review-queue": {
+      "version": "1.0.0",
+      "path": "git-and-review-workflow/review-queue"
     }
   }
 }

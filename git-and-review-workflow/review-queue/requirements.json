@@ -1,0 +1,1 @@
+{"schema_version": 1, "requires": {"review-all": {"minimum": "1.1.0", "maximum_exclusive": "2.0.0"}}}
