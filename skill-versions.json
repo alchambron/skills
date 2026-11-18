@@ -28,6 +28,18 @@
     "review-queue": {
       "version": "1.0.0",
       "path": "git-and-review-workflow/review-queue"
+    },
+    "respond": {
+      "version": "1.0.0",
+      "path": "git-and-review-workflow/respond"
+    },
+    "respond-all": {
+      "version": "1.0.0",
+      "path": "git-and-review-workflow/respond-all"
+    },
+    "respond-queue": {
+      "version": "1.0.0",
+      "path": "git-and-review-workflow/respond-queue"
     }
   }
 }
