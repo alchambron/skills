@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "requires": {
+    "respond-all": {
+      "minimum": "1.0.0",
+      "maximum_exclusive": "2.0.0"
+    },
+    "respond": {
+      "minimum": "1.0.0",
+      "maximum_exclusive": "2.0.0"
+    }
+  }
+}
