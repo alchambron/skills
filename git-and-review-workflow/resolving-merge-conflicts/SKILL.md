@@ -3,7 +3,7 @@ name: resolving-merge-conflicts
 description: "Use when you need to resolve an in-progress git merge/rebase conflict."
 ---
 
-1. **See the current state** of the merge/rebase. Check git history, conflicting files, and existing staged and unstaged work. Read the applicable `AGENT.md` rules, including approval for changes affecting three or more files. Honor authorization already given for this task.
+1. **See the current state** of the merge/rebase. Check git history, conflicting files, and existing staged and unstaged work. Read the repository's `AGENT.md` for its authorization policy and apply any standing authorization that covers this task.
 
 2. **Find the primary sources** for each conflict. Understand deeply why each change was made, and what the original intent was. Read the commit messages, check the PRs, check original issues/tickets.
 
