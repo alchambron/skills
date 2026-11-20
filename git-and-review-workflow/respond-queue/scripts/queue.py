@@ -21,7 +21,6 @@ import subprocess
 import sys
 import uuid
 from datetime import datetime, timezone
-import fcntl
 
 ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY = 'EnerZam/JouleMV'
@@ -45,6 +44,9 @@ def load(name, path):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+shared_slots = load('review_response_shared_slots', Path(__file__).with_name('shared_slots.py'))
 
 
 def parse_version(value, label):
@@ -223,9 +225,7 @@ def ledger_entry(ledger_module, run_dir, number, batch):
 
 @contextmanager
 def locked(root):
-    root.mkdir(parents=True, exist_ok=True)
-    with (root/'queue.lock').open('a') as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
+    with shared_slots.locked(root):
         path = root/'state.json'
         state = json.loads(path.read_text()) if path.exists() else {'schema_version': 1, 'jobs': {}, 'batches': {}, 'skips': []}
         for key, value in (('jobs', {}), ('batches', {}), ('skips', [])):
@@ -256,14 +256,10 @@ def active_jobs(state):
     return [j for j in state['jobs'].values() if j.get('status') == 'active']
 
 
-def reserve(state, phase, number, head, batch, run_dir, thread, host_ready):
+def reserve(state, phase, number, head, batch, run_dir, thread, host_ready, *, state_root):
     if not host_ready:
         raise ValueError('Mac busy, offline or status unknown')
-    active = active_jobs(state)
-    if any(j['number'] == number for j in active):
-        raise ValueError('PR already reserved')
-    if sum(j['phase'] == phase for j in active) >= {'analysis': 2, 'fix': 1}[phase]:
-        raise ValueError('machine-wide resource cap reached')
+    shared_slots.check_capacity(state_root, 'respond-queue', phase, number, active_jobs(state))
     key = f'{number}:{batch}'
     prior = state['batches'].get(key)
     if prior and prior['status'] in TERMINAL:
@@ -523,7 +519,7 @@ def main(argv=None):
                 raise ValueError('head moved; refresh analysis')
             with locked(args.state) as state:
                 token = reserve(state, args.phase, args.number, args.head, args.batch,
-                                args.run_dir.resolve(), args.thread, args.host_ready)
+                                args.run_dir.resolve(), args.thread, args.host_ready, state_root=args.state)
             print(json.dumps({'token': token})); return 0
         # guard: read the reservation, verify GitHub without holding the lock, then recheck.
         with locked(args.state) as state:

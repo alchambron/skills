@@ -1,34 +1,43 @@
 #!/usr/bin/env python3
-"""Read-only GitHub queue planning and durable, fail-closed cross-thread reservations.
-
-Reservations never expire: interrupted jobs require verified cleanup before release.
-No command launches a thread, runtime or GitHub mutation.
-"""
+"""Plan directly requested JouleMV reviews and reserve shared Mac review slots."""
 import argparse
-from contextlib import contextmanager
 import datetime as dt
-import fcntl
+import importlib.util
 import json
-import os
 from pathlib import Path
+import re
 import sys
 import uuid
-from zoneinfo import ZoneInfo
+
+from queue_digest import digest_date, export, review_result, write_atomic
 
 REPOSITORY = 'EnerZam/JouleMV'
 LOGIN = 'alchambron'
 ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_STATE = Path.home() / '.codex/review-state/review-queue'
+REPORT = Path('report/scenario-guide.html')
+SHA = re.compile(r'[0-9a-f]{40}')
 
 
-def load_review(path):
-    sys.path.insert(0, str(Path(path).resolve() / 'scripts'))
+def load_slots(respond_queue):
+    path = respond_queue.resolve() / 'scripts/shared_slots.py'
+    spec = importlib.util.spec_from_file_location('review_queue_slots', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_review(path, respond_queue):
+    sys.path.insert(0, str(path.resolve() / 'scripts'))
     import check_dependencies
     import history
     import skill_versions
-    limits = skill_versions.requirements(ROOT, ['review-all'])['review-all']
-    _, error = skill_versions.version_status(path, limits)
-    if error:
-        raise ValueError(error)
+
+    limits = skill_versions.requirements(ROOT, ('review-all', 'respond-queue'))
+    for name, folder in (('review-all', path), ('respond-queue', respond_queue)):
+        _, error = skill_versions.version_status(folder, limits[name])
+        if error:
+            raise ValueError(f'{name} at {folder}: {error}')
     skill_versions.parse_version(skill_versions.read_version(ROOT))
     result = check_dependencies.check(skill_dir=path)
     if not result['ok']:
@@ -36,133 +45,326 @@ def load_review(path):
     return history
 
 
+def now():
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def read_state(root):
+    try:
+        state = json.loads((root / 'state.json').read_text())
+    except FileNotFoundError:
+        state = {'version': 1, 'jobs': {}}
+    if state.get('version') != 1 or not isinstance(state.get('jobs'), dict):
+        raise ValueError('invalid review queue state')
+    state.setdefault('skips', [])
+    return state
+
+
+def save_json(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_atomic(path, json.dumps(data, indent=2) + '\n')
+
+
+def save_state(root, state):
+    save_json(root / 'state.json', state)
+
+
 def eligible(pr):
-    return (pr.get('state') == 'open' and not pr.get('draft') and
-            pr.get('base', {}).get('repo', {}).get('full_name', '').casefold() == REPOSITORY.casefold() and
-            LOGIN in {u.get('login', '').casefold() for u in pr.get('requested_reviewers', [])})
+    if pr['state'] != 'open' or pr['draft']:
+        return False
+    reviewers = pr['requested_reviewers']
+    if not isinstance(reviewers, list):
+        raise ValueError('incomplete direct reviewer inventory')
+    return (pr['base']['repo']['full_name'].casefold() == REPOSITORY.casefold()
+            and LOGIN in {user['login'].casefold() for user in reviewers})
 
 
-def overnight(now, receipt):
-    local = now.astimezone(ZoneInfo('America/Toronto'))
-    day = local.date() if local.hour >= 22 else local.date() - dt.timedelta(days=1)
-    start = dt.datetime.combine(day, dt.time(22), ZoneInfo('America/Toronto'))
-    deadline = dt.datetime.combine(day + dt.timedelta(days=1), dt.time(9), ZoneInfo('America/Toronto'))
-    if not start <= local < deadline:
-        raise ValueError('outside 22:00–09:00 Toronto window')
-    if receipt.get('repository') != REPOSITORY or receipt.get('status') != 'completed':
-        raise ValueError('update-from-work completion receipt missing')
-    began = dt.datetime.fromisoformat(receipt['started_at'])
-    ended = dt.datetime.fromisoformat(receipt['completed_at'])
-    if not start <= began <= ended <= now:
-        raise ValueError('update-from-work receipt is stale or invalid')
-    return deadline.isoformat()
+def pins(pr):
+    revision = {key: pr[key]['sha'] for key in ('head', 'base')}
+    if any(not isinstance(sha, str) or not SHA.fullmatch(sha) for sha in revision.values()):
+        raise ValueError('missing or invalid GitHub head/base pin')
+    return revision
 
 
-@contextmanager
-def locked(root):
-    root.mkdir(parents=True, exist_ok=True)
-    with (root / 'queue.lock').open('a') as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
-        state = json.loads((root / 'state.json').read_text()) if (root / 'state.json').exists() else {'version': 1, 'jobs': {}}
-        yield state
-        temporary = root / 'state.tmp'
-        temporary.write_text(json.dumps(state, indent=2) + '\n')
-        temporary.replace(root / 'state.json')
+def fetch_pr(api, number):
+    pr = api.get(f'repos/{REPOSITORY}/pulls/{number}')
+    if pr['number'] != number:
+        raise ValueError('GitHub returned a different PR number')
+    return pr
 
 
-def reserve(state, phase, number, pins, run_dir, thread):
-    active = [j for j in state['jobs'].values() if j['status'] == 'active']
-    if any(j['number'] == number for j in active):
-        raise ValueError('PR already active')
-    if sum(j['phase'] == phase for j in active) >= {'static': 2, 'live': 1}[phase]:
-        raise ValueError('resource cap reached')
+def inventory(api, number):
+    if number is not None:
+        return [fetch_pr(api, number)]
+    rows = {}
+    for page in range(1, 101):
+        chunk = api.get(f'repos/{REPOSITORY}/pulls', {'state': 'open', 'per_page': 100, 'page': page})
+        if not isinstance(chunk, list):
+            raise ValueError('incomplete open PR inventory')
+        rows.update((pr['number'], pr) for pr in chunk)
+        if len(chunk) < 100:
+            return rows.values()
+    raise ValueError('open PR inventory exceeded 100 pages')
+
+
+def plan_reviews(api, history, prior, state, number):
+    selected, skipped, warnings = [], [], []
+    attempts = {job['number']: (token, job) for token, job in state['jobs'].items()}
+    active = {job['number'] for job in state['jobs'].values() if job['status'] == 'active'}
+    for pr in inventory(api, number):
+        pr_number = pr['number']
+        item = {'key': history.key_of(REPOSITORY, pr_number), 'number': pr_number,
+                'repository': REPOSITORY, 'url': pr['html_url']}
+        if not eligible(pr):
+            if number is not None:
+                skipped.append({**item, 'reason': 'no current direct request on an open non-draft PR'})
+            continue
+        if pr_number in active:
+            skipped.append({**item, 'reason': 'resume existing reservation'})
+            continue
+        revision = pins(pr)
+        entry = prior['prs'].get(item['key'])
+        kind, basis = history.classify(entry, revision['head'], False)
+        if entry and entry.get('reviewedHead') and entry.get('reviewedBase') != revision['base']:
+            kind, basis = 'moved', {'mode': 'full', 'previousRun': entry.get('runDir'),
+                                    'reason': 'base_changed_or_unrecorded'}
+        if kind == 'moved' and basis['mode'] == 'incremental':
+            basis = history.carry_basis(api, REPOSITORY, entry, revision['head'], basis, warnings)
+        token, last = attempts.get(pr_number, (None, {}))
+        if kind == 'awaiting_decision':
+            previous_run = basis.get('previousRun')
+            failed = last.get('pins') == revision and last.get('result', {}).get('status') in ('blocked', 'failed')
+            if previous_run and (Path(previous_run) / REPORT).is_file() and not failed:
+                skipped.append({**item, **revision, 'reason': 'awaiting Alexis decision at current pins'})
+                continue
+        selected.append({**item, **revision, 'kind': kind, 'basis': basis, 'previous_attempt': token,
+                         'title': pr.get('title'), 'updatedAt': pr.get('updated_at'),
+                         'createdAt': pr.get('created_at')})
+    selected.sort(key=lambda row: (history.PRIORITY[row['kind']], row['createdAt'] or '', row['number']))
+    return {'login': LOGIN, 'searchComplete': True, 'selected': selected, 'skipped': skipped, 'warnings': warnings}
+
+
+def recheck(api, number, expected):
+    pr = fetch_pr(api, number)
+    if not eligible(pr):
+        raise ValueError('PR no longer directly requested, open and non-draft')
+    if pins(pr) != expected:
+        raise ValueError('head or base moved; replan the current revision')
+
+
+def claim(root, slots, state, selection, run_dir, thread):
+    number = selection['number']
+    run_dir = str(run_dir.resolve())
+    attempts = [(token, job) for token, job in state['jobs'].items() if job['number'] == number]
+    if (attempts[-1][0] if attempts else None) != selection['previous_attempt']:
+        raise ValueError('selection predates a newer attempt; replan')
+    jobs = [job for job in state['jobs'].values() if job['status'] == 'active']
+    slots.check_capacity(root, 'review-queue', 'static', number, jobs)
+    if any(job['run_dir'] == run_dir for job in state['jobs'].values()):
+        raise ValueError('start each attempt in a new run directory; resume active reservations with their token')
     token = uuid.uuid4().hex
-    state['jobs'][token] = dict(number=number, phase=phase, pins=pins, run_dir=str(run_dir), thread=thread,
-                                status='active', started_at=dt.datetime.now(dt.timezone.utc).isoformat())
+    state['jobs'][token] = {'number': number, 'pins': {key: selection[key] for key in ('head', 'base')},
+                            'run_dir': run_dir, 'thread': thread, 'phase': 'static',
+                            'status': 'active', 'started_at': now().isoformat()}
     return token
 
 
-def main(argv=None):
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--review-all', required=True, type=Path)
-    p.add_argument('--state', type=Path, default=Path.home()/'.codex/review-state/review-queue')
-    sub = p.add_subparsers(dest='command', required=True)
-    plan = sub.add_parser('plan'); plan.add_argument('--output', required=True, type=Path)
-    claim = sub.add_parser('claim')
-    claim.add_argument('--phase', choices=['static', 'live'], required=True)
-    claim.add_argument('--number', type=int, required=True)
-    claim.add_argument('--run-dir', type=Path, required=True)
-    claim.add_argument('--thread', required=True)
-    claim.add_argument('--host-ready', action='store_true', help='Coordinator verified host idle, available and no unrelated runtime')
-    claim.add_argument('--update-receipt', type=Path)
-    finish = sub.add_parser('finish'); finish.add_argument('--token', required=True)
-    finish.add_argument('--cleanup-verified', action='store_true')
-    digest = sub.add_parser('digest'); digest.add_argument('--output', required=True, type=Path)
-    args = p.parse_args(argv)
+def active_job(state, token):
+    job = state['jobs'].get(token)
+    if not job or job['status'] != 'active':
+        raise ValueError('active review reservation required')
+    return job
+
+
+def defer(state, command, reason, number=None, token=None):
+    if token:
+        job = state['jobs'].get(token)
+        if job and job['status'] == 'active':
+            number = job['number']
+            job['defer_reason'] = reason
+    state['skips'].append({'at': now().isoformat(), 'command': command, 'reason': reason, 'number': number})
+    state['skips'] = state['skips'][-200:]
+
+
+def read_result(path, job):
     try:
-        history = load_review(args.review_all)
+        (pr,) = json.loads(path.read_text())['prs']
+        if str(pr['repository']).casefold() == REPOSITORY.casefold() and pr['number'] == job['number']:
+            if all(pr.get(f'{key}_sha') in (None, sha) for key, sha in job['pins'].items()):
+                return pr
+    except (OSError, KeyError, TypeError, ValueError):
+        pass
+    return {}
+
+
+def run_result(job):
+    run = Path(job['run_dir'])
+    report = run / REPORT
+    ledger = read_result(run / 'results.json', job)
+    rendered = read_result(report.with_name('results.json'), job)
+    if rendered and report.is_file() and report.stat().st_size:
+        return ledger, rendered, str(report)
+    return ledger, {}, None
+
+
+def finish(state, token, status, reason, cleanup):
+    job = state['jobs'].get(token)
+    if not job:
+        raise ValueError('unknown reservation token')
+    if job.get('result'):
+        return job
+    if not cleanup:
+        raise ValueError('verify worker and owned runtime cleanup before release')
+    pr, rendered, report = run_result(job)
+    verdict = pr.get('review', {}).get('status', 'pending')
+    raw_live = pr.get('live', {}).get('status')
+    raw_publication = pr.get('publication', {}).get('status')
+    live = rendered.get('live', {}).get('display_status', raw_live)
+    publication = rendered.get('publication', {}).get('display_status', raw_publication)
+    if status == 'completed':
+        if (not report or verdict not in ('clean', 'issues') or live not in ('complete', 'not_required')
+                or publication not in ('verified', 'reused', 'not_required', 'not_requested')
+                or live != raw_live or publication != raw_publication
+                or rendered.get('live', {}).get('cleanup_status') == 'pending'
+                or rendered.get('freshness') != 'current' or rendered.get('review', {}).get('status') != verdict
+                or not Path(report).with_name('inline-report.html').is_file()
+                or pr.get('current_head_sha') != job['pins']['head']
+                or pr.get('current_base_sha') != job['pins']['base']):
+            raise ValueError('completion requires the matching fresh review-all ledger, settled publication and runtime, and HTML')
+    elif not reason or not reason.strip():
+        raise ValueError('blocked and failed reviews require a reason')
+    job.update(status='finished', finished_at=now().isoformat(),
+               result={'status': status, 'verdict': verdict, 'html_path': report, 'reason': reason,
+                       'live': live, 'publication': publication})
+    job.pop('defer_reason', None)
+    return job
+
+
+def claim_selection(path):
+    data = json.loads(path.read_text())
+    (selected,) = data['selected']
+    if data['login'] != LOGIN or not data['searchComplete'] or selected['repository'] != REPOSITORY:
+        raise ValueError('claim requires a complete, single-PR queue selection')
+    return selected
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--review-all', type=Path, default=ROOT.parent / 'review-all')
+    parser.add_argument('--respond-queue', type=Path, default=ROOT.parent / 'respond-queue')
+    parser.add_argument('--state', type=Path, default=DEFAULT_STATE)
+    commands = parser.add_subparsers(dest='command', required=True)
+    plan = commands.add_parser('plan')
+    plan.add_argument('--number', type=int, help='Plan the PR named in a review-request event')
+    plan.add_argument('--output', type=Path, required=True)
+    start = commands.add_parser('claim')
+    start.add_argument('--selection', type=Path, required=True)
+    start.add_argument('--run-dir', type=Path, required=True)
+    start.add_argument('--thread', required=True)
+    start.add_argument('--host-ready', action='store_true')
+    commands.add_parser('park').add_argument('--token', required=True)
+    commands.add_parser('guard').add_argument('--token', required=True)
+    live = commands.add_parser('claim-live')
+    live.add_argument('--token', required=True)
+    live.add_argument('--host-ready', action='store_true')
+    release = commands.add_parser('finish')
+    release.add_argument('--token', required=True)
+    release.add_argument('--status', choices=('completed', 'blocked', 'failed'), required=True)
+    release.add_argument('--reason')
+    release.add_argument('--cleanup-verified', action='store_true')
+    wait = commands.add_parser('defer')
+    wait.add_argument('--number', type=int)
+    wait.add_argument('--token')
+    wait.add_argument('--reason', required=True)
+    commands.add_parser('digest').add_argument('--date', type=dt.date.fromisoformat)
+    args = parser.parse_args(argv)
+    root = args.state.resolve()
+    slots = None
+    number = getattr(args, 'number', None)
+    token = getattr(args, 'token', None)
+    try:
+        slots = load_slots(args.respond_queue)
+        if args.command in ('finish', 'digest', 'defer', 'park'):
+            with slots.locked(root):
+                state = read_state(root)
+                if args.command == 'digest':
+                    print(export(root, state, args.date or digest_date(now())))
+                    return 0
+                if args.command == 'finish':
+                    job = finish(state, token, args.status, args.reason, args.cleanup_verified)
+                    save_state(root, state)
+                    date = digest_date(dt.datetime.fromisoformat(job['finished_at']))
+                    path = export(root, state, date)
+                    print(json.dumps({'digest': str(path), **review_result(token, job, job['result'])}))
+                    return 0
+                if args.command == 'park':
+                    job = active_job(state, token)
+                    if job['phase'] != 'static':
+                        raise ValueError('only a static reservation can wait for runtime')
+                    job['phase'] = 'waiting_live'
+                else:
+                    defer(state, 'defer', args.reason, number, token)
+                save_state(root, state)
+            return 0
+
+        history = load_review(args.review_all, args.respond_queue)
         api = history.GitHub()
-        if api.get('user').get('login', '').casefold() != LOGIN:
+        if api.get('user')['login'].casefold() != LOGIN:
             raise ValueError('authenticated account must be alchambron')
         if args.command == 'plan':
+            with slots.locked(root):
+                state = read_state(root)
             with history.locked() as directory:
                 prior = history.read_state(directory)
-            result = history.select(api, prior, [REPOSITORY], False, args.state/'search')
-            if not result['searchComplete']:
-                raise ValueError('incomplete inventory; no dispatch')
-            result['selected'] = [c for c in result['selected'] if eligible(api.get(f"repos/{REPOSITORY}/pulls/{c['number']}"))]
-            history.save_json(args.output, result)
-            print(json.dumps({'selection': str(args.output), 'count': len(result['selected'])}))
-        elif args.command == 'claim':
-            if not args.host_ready:
-                raise ValueError('host busy or availability unknown')
-            pr = api.get(f'repos/{REPOSITORY}/pulls/{args.number}')
-            if not eligible(pr):
-                raise ValueError('PR no longer eligible')
-            if args.phase == 'live':
-                overnight(dt.datetime.now(dt.timezone.utc), json.loads(args.update_receipt.read_text()) if args.update_receipt else {})
-                ledger = json.loads((args.run_dir/'results.json').read_text())
-                rows = [r for r in ledger['prs'] if r['repository'] == REPOSITORY and r['number'] == args.number]
-                if len(rows) != 1 or rows[0]['review']['status'] != 'clean':
-                    raise ValueError('live queue requires clean static review')
-                if rows[0]['head_sha'] != pr['head']['sha'] or rows[0]['base_sha'] != pr['base']['sha']:
-                    raise ValueError('pins moved; static refresh required')
-            with locked(args.state) as state:
-                token = reserve(state, args.phase, args.number, {'head': pr['head']['sha'], 'base': pr['base']['sha']}, args.run_dir, args.thread)
+            selection = plan_reviews(api, history, prior, state, number)
+            save_json(args.output, selection)
+            print(json.dumps({'selection': str(args.output), 'count': len(selection['selected'])}))
+            return 0
+
+        if args.command in ('claim', 'claim-live') and not args.host_ready:
+            raise ValueError('Mac busy, offline or availability unknown')
+        if args.command == 'claim':
+            selection = claim_selection(args.selection)
+            number = selection['number']
+            recheck(api, number, {key: selection[key] for key in ('head', 'base')})
+            with slots.locked(root):
+                state = read_state(root)
+                token = claim(root, slots, state, selection, args.run_dir, args.thread)
+                save_state(root, state)
             print(json.dumps({'token': token}))
-        elif args.command == 'finish':
-            with locked(args.state) as state:
-                job = state['jobs'][args.token]
-                if job['phase'] == 'live' and not args.cleanup_verified:
-                    raise ValueError('retain live reservation until cleanup verified')
-                job['status'] = 'finished'
-                job['finished_at'] = dt.datetime.now(dt.timezone.utc).isoformat()
-        else:
-            with locked(args.state) as state:
-                jobs = dict(state['jobs'])
-            rows = []
-            for token, job in jobs.items():
-                run = Path(job['run_dir'])
-                row = {**job, 'token': token, 'ledger': str(run/'results.json'),
-                       'report': str(run/'report/scenario-guide.html')}
-                try:
-                    data = json.loads((run/'results.json').read_text())
-                    targets = [pr for pr in data['prs'] if pr['repository'] == REPOSITORY and pr['number'] == job['number']]
-                    if len(targets) != 1:
-                        raise ValueError('missing unique PR ledger entry')
-                    pr = targets[0]
-                    row['outcome'] = {key: pr.get(key) for key in
-                                      ('url', 'head_sha', 'base_sha', 'current_head_sha', 'current_base_sha',
-                                       'review_request', 'review', 'publication', 'live', 'coverage_gaps', 'scenarios')}
-                    row['report_exists'] = (run/'report/scenario-guide.html').is_file()
-                except (OSError, ValueError, KeyError, TypeError) as exc:
-                    row['error'] = str(exc)
-                rows.append(row)
-            history.save_json(args.output, {'generated_at': dt.datetime.now(dt.timezone.utc).isoformat(),
-                                           'jobs': rows, 'note': 'Saved outcomes; refresh request/pins before current claims. Reservations are not acceptance outcomes.'})
+            return 0
+
+        with slots.locked(root):
+            reservation = active_job(read_state(root), token)
+        recheck(api, reservation['number'], reservation['pins'])
+        with slots.locked(root):
+            state = read_state(root)
+            job = active_job(state, token)
+            if job != reservation:
+                raise ValueError('reservation changed during GitHub check; retry')
+            if args.command == 'claim-live':
+                if job['phase'] != 'waiting_live':
+                    raise ValueError('park the static reservation before claiming runtime')
+                peers = [other for key, other in state['jobs'].items() if key != token and other['status'] == 'active']
+                slots.check_capacity(root, 'review-queue', 'live', job['number'], peers)
+                job['phase'] = 'live'
+                job.pop('defer_reason', None)
+                save_state(root, state)
+            elif job['phase'] not in ('static', 'live'):
+                raise ValueError('publication requires a static or live slot')
+        print(json.dumps({'eligible': True, 'number': job['number'], 'phase': job['phase'], **job['pins']}))
         return 0
-    except Exception as exc:  # CLI boundary: fail closed, including dependency/API errors.
-        print(json.dumps({'status': 'skipped', 'reason': str(exc)}))
+    except Exception as exc:  # CLI boundary, including dependency and GitHub failures.
+        if slots is not None:
+            try:
+                with slots.locked(root):
+                    state = read_state(root)
+                    defer(state, args.command, str(exc), number, token)
+                    save_state(root, state)
+            except (OSError, ValueError, TypeError):
+                pass
+        print(json.dumps({'status': 'deferred', 'command': args.command, 'number': number,
+                          'token': token, 'reason': str(exc)}))
         return 2
 
 

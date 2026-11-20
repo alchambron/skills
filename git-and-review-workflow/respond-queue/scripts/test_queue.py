@@ -5,6 +5,8 @@ import io
 import json
 import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -74,12 +76,14 @@ def run(*argv):
     return code, out.getvalue()
 
 
-class StateMachineTests(unittest.TestCase):
+class StateMachineTests(Contexts):
     def setUp(self):
         self.state = {'jobs': {}, 'batches': {}, 'skips': []}
+        self.root = Path(self.enter(tempfile.TemporaryDirectory()))/'respond-queue'
 
-    def claim(self, phase='analysis', number=1, batch='batch', head='head'):
-        return q.reserve(self.state, phase, number, head, batch, '/tmp/run', 'thread', True)
+    def claim(self, phase='analysis', number=1, batch='batch', head='head', host_ready=True):
+        return q.reserve(self.state, phase, number, head, batch, '/tmp/run', 'thread',
+                         host_ready, state_root=self.root)
 
     def analyzed(self, number=1, batch='batch'):
         q.finish(self.state, self.claim('analysis', number, batch), {'status': 'analyzed'}, True)
@@ -101,7 +105,7 @@ class StateMachineTests(unittest.TestCase):
 
     def test_host_unknown(self):
         with self.assertRaises(ValueError):
-            q.reserve(self.state, 'fix', 1, 'h', 'b', '/tmp', 't', False)
+            self.claim('fix', host_ready=False)
         self.assertEqual(self.state['jobs'], {})
 
     def test_fix_requires_analysis(self):
@@ -330,6 +334,46 @@ class CliTests(Contexts):
         self.assertEqual(self.state_data()['batches'], {})
         self.assertEqual(len(self.state_data()['skips']), 5)
 
+    def test_review_queue_reservations_gate_response_claims(self):
+        review_root = self.root/'review-queue'
+        review_root.mkdir()
+        jobs = review_root/'state.json'
+        jobs.write_text(json.dumps({'jobs': {
+            'parked': {'status': 'active', 'phase': 'waiting_live', 'number': 1},
+        }}))
+        code, out = self.claim()
+        self.assertEqual(code, 2)
+        self.assertIn('reserved by review-queue', out['reason'])
+
+        jobs.write_text(json.dumps({'jobs': {
+            'static1': {'status': 'active', 'phase': 'static', 'number': 2},
+            'static2': {'status': 'active', 'phase': 'static', 'number': 3},
+        }}))
+        code, out = self.claim()
+        self.assertEqual(code, 2)
+        self.assertIn('shared static resource cap', out['reason'])
+
+        jobs.write_text(json.dumps({'jobs': {
+            'runtime': {'status': 'active', 'phase': 'live', 'number': 2},
+        }}))
+        code, out = self.claim()
+        self.assertEqual(code, 0)
+        self.assertEqual(self.finish(out['token'], {'status': 'analyzed'}), 0)
+        code, out = self.claim('fix')
+        self.assertEqual(code, 2)
+        self.assertIn('shared live resource cap', out['reason'])
+
+    def test_malformed_review_queue_state_prevents_claim(self):
+        peer = self.root/'review-queue'
+        peer.mkdir()
+        for state in ('{', '{}', '{"jobs":{"token":{"status":"active","number":2,"phase":"unknown"}}}'):
+            with self.subTest(state=state):
+                (peer/'state.json').write_text(state)
+                code, out = self.claim()
+                self.assertEqual(code, 2)
+                self.assertIn('shared slot state', out['reason'])
+        self.assertEqual(self.state_data()['jobs'], {})
+
     def test_guard_checks_reservation_head_feedback_and_race(self):
         code, out = self.claim()
         self.assertEqual(code, 0)
@@ -467,6 +511,43 @@ class CliTests(Contexts):
     def test_digest_runs_offline(self):
         with mock.patch.object(q, 'api', side_effect=AssertionError('network')):
             self.assertEqual(run('--state', str(self.state), 'digest')[0], 0)
+
+
+class SharedSlotProcessTests(Contexts):
+    def test_two_queue_processes_compete_for_last_slot(self):
+        root = Path(self.enter(tempfile.TemporaryDirectory()))
+        review = root/'review-queue'
+        q.save(review/'state.json', {'jobs': {'first': {'number': 1, 'phase': 'static', 'status': 'active'}}})
+        script = '''
+import json
+from pathlib import Path
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from shared_slots import check_capacity, locked
+
+root, phase, number = Path(sys.argv[2]), sys.argv[3], int(sys.argv[4])
+path = root / 'state.json'
+with locked(root):
+    jobs = json.loads(path.read_text())['jobs'] if path.exists() else {}
+    try:
+        check_capacity(root, root.name, phase, number, jobs.values())
+    except ValueError as exc:
+        sys.exit(str(exc))
+    jobs[str(number)] = dict(number=number, phase=phase, status='active')
+    path.write_text(json.dumps({'jobs': jobs}))
+'''
+        processes = []
+        for queue, phase, number in ((review, 'static', 2), (root/'respond-queue', 'analysis', 3)):
+            process = self.enter(subprocess.Popen(
+                [sys.executable, '-B', '-c', script, str(Path(__file__).resolve().parent),
+                 str(queue), phase, str(number)], stderr=subprocess.PIPE, text=True,
+            ))
+            self.addCleanup(process.kill)
+            processes.append(process)
+        errors = [process.communicate(timeout=10)[1] for process in processes]
+        self.assertEqual(sorted(process.returncode for process in processes), [0, 1], errors)
+        self.assertIn('shared static resource cap', ''.join(errors))
 
 
 if __name__ == '__main__': unittest.main()
