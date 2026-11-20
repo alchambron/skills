@@ -54,9 +54,12 @@ def read_state(root):
         state = json.loads((root / 'state.json').read_text())
     except FileNotFoundError:
         state = {'version': 1, 'jobs': {}}
-    if state.get('version') != 1 or not isinstance(state.get('jobs'), dict):
+    if (not isinstance(state, dict) or state.get('version') != 1
+            or not isinstance(state.get('jobs'), dict) or not isinstance(state.get('skips', []), list)
+            or not isinstance(state.get('pending_digest_dates', []), list)):
         raise ValueError('invalid review queue state')
     state.setdefault('skips', [])
+    state.setdefault('pending_digest_dates', [])
     return state
 
 
@@ -91,6 +94,13 @@ def fetch_pr(api, number):
     if pr['number'] != number:
         raise ValueError('GitHub returned a different PR number')
     return pr
+
+
+def authenticated_api(history):
+    api = history.GitHub()
+    if api.get('user')['login'].casefold() != LOGIN:
+        raise ValueError('authenticated account must be alchambron')
+    return api
 
 
 def inventory(api, number):
@@ -179,9 +189,10 @@ def active_job(state, token):
 def defer(state, command, reason, number=None, token=None):
     if token:
         job = state['jobs'].get(token)
-        if job and job['status'] == 'active':
+        if job:
             number = job['number']
-            job['defer_reason'] = reason
+            if job['status'] == 'active':
+                job['defer_reason'] = reason
     state['skips'].append({'at': now().isoformat(), 'command': command, 'reason': reason, 'number': number})
     state['skips'] = state['skips'][-200:]
 
@@ -202,9 +213,18 @@ def run_result(job):
     report = run / REPORT
     ledger = read_result(run / 'results.json', job)
     rendered = read_result(report.with_name('results.json'), job)
-    if rendered and report.is_file() and report.stat().st_size:
-        return ledger, rendered, str(report)
+    try:
+        if rendered and report.is_file() and report.stat().st_size:
+            return ledger, rendered, str(report)
+    except OSError:
+        pass
     return ledger, {}, None
+
+
+def evidence_field(row, section, key='status'):
+    evidence = row.get(section)
+    value = evidence.get(key) if isinstance(evidence, dict) else None
+    return value if isinstance(value, str) else None
 
 
 def finish(state, token, status, reason, cleanup):
@@ -216,17 +236,17 @@ def finish(state, token, status, reason, cleanup):
     if not cleanup:
         raise ValueError('verify worker and owned runtime cleanup before release')
     pr, rendered, report = run_result(job)
-    verdict = pr.get('review', {}).get('status', 'pending')
-    raw_live = pr.get('live', {}).get('status')
-    raw_publication = pr.get('publication', {}).get('status')
-    live = rendered.get('live', {}).get('display_status', raw_live)
-    publication = rendered.get('publication', {}).get('display_status', raw_publication)
+    verdict = evidence_field(pr, 'review') or 'pending'
+    raw_live = evidence_field(pr, 'live')
+    raw_publication = evidence_field(pr, 'publication')
+    rendered_live = evidence_field(rendered, 'live', 'display_status')
+    rendered_publication = evidence_field(rendered, 'publication', 'display_status')
     if status == 'completed':
-        if (not report or verdict not in ('clean', 'issues') or live not in ('complete', 'not_required')
-                or publication not in ('verified', 'reused', 'not_required', 'not_requested')
-                or live != raw_live or publication != raw_publication
-                or rendered.get('live', {}).get('cleanup_status') == 'pending'
-                or rendered.get('freshness') != 'current' or rendered.get('review', {}).get('status') != verdict
+        if (not report or verdict not in ('clean', 'issues') or raw_live not in ('complete', 'not_required')
+                or raw_publication not in ('verified', 'reused', 'not_required', 'not_requested')
+                or rendered_live != raw_live or rendered_publication != raw_publication
+                or evidence_field(rendered, 'live', 'cleanup_status') == 'pending'
+                or rendered.get('freshness') != 'current' or evidence_field(rendered, 'review') != verdict
                 or not Path(report).with_name('inline-report.html').is_file()
                 or pr.get('current_head_sha') != job['pins']['head']
                 or pr.get('current_base_sha') != job['pins']['base']):
@@ -235,9 +255,42 @@ def finish(state, token, status, reason, cleanup):
         raise ValueError('blocked and failed reviews require a reason')
     job.update(status='finished', finished_at=now().isoformat(),
                result={'status': status, 'verdict': verdict, 'html_path': report, 'reason': reason,
-                       'live': live, 'publication': publication})
+                       'live': rendered_live or raw_live, 'publication': rendered_publication or raw_publication})
     job.pop('defer_reason', None)
     return job
+
+
+def export_digest(root, state, day):
+    path = export(root, state, day)
+    key = day.isoformat()
+    if key in state['pending_digest_dates']:
+        state['pending_digest_dates'].remove(key)
+        save_state(root, state)
+    return path
+
+
+def finish_command(args, root, slots):
+    status, reason = args.status, args.reason
+    if status == 'completed' and args.cleanup_verified:
+        with slots.locked(root):
+            job = read_state(root)['jobs'].get(args.token)
+        if job is None:
+            raise ValueError('unknown reservation token')
+        if not job.get('result'):
+            api = authenticated_api(load_review(args.review_all, args.respond_queue))
+            if pins(fetch_pr(api, job['number'])) != job['pins']:
+                status, reason = 'blocked', 'head or base moved since review; replan the current revision'
+
+    with slots.locked(root):
+        state = read_state(root)
+        job = finish(state, args.token, status, reason, args.cleanup_verified)
+        day = digest_date(dt.datetime.fromisoformat(job['finished_at']))
+        key = day.isoformat()
+        if key not in state['pending_digest_dates']:
+            state['pending_digest_dates'].append(key)
+        save_state(root, state)
+        path = export_digest(root, state, day)
+        return {'digest': str(path), **review_result(args.token, job, job['result'])}
 
 
 def claim_selection(path):
@@ -276,7 +329,9 @@ def main(argv=None):
     wait.add_argument('--number', type=int)
     wait.add_argument('--token')
     wait.add_argument('--reason', required=True)
-    commands.add_parser('digest').add_argument('--date', type=dt.date.fromisoformat)
+    digest = commands.add_parser('digest').add_mutually_exclusive_group()
+    digest.add_argument('--date', type=dt.date.fromisoformat)
+    digest.add_argument('--retry-pending', action='store_true')
     args = parser.parse_args(argv)
     root = args.state.resolve()
     slots = None
@@ -284,18 +339,23 @@ def main(argv=None):
     token = getattr(args, 'token', None)
     try:
         slots = load_slots(args.respond_queue)
-        if args.command in ('finish', 'digest', 'defer', 'park'):
+        if args.command == 'finish':
+            print(json.dumps(finish_command(args, root, slots)))
+            return 0
+        if args.command in ('digest', 'defer', 'park'):
             with slots.locked(root):
                 state = read_state(root)
                 if args.command == 'digest':
-                    print(export(root, state, args.date or digest_date(now())))
-                    return 0
-                if args.command == 'finish':
-                    job = finish(state, token, args.status, args.reason, args.cleanup_verified)
-                    save_state(root, state)
-                    date = digest_date(dt.datetime.fromisoformat(job['finished_at']))
-                    path = export(root, state, date)
-                    print(json.dumps({'digest': str(path), **review_result(token, job, job['result'])}))
+                    if args.retry_pending:
+                        exports, failures = [], {}
+                        for key in list(state['pending_digest_dates']):
+                            try:
+                                exports.append(str(export_digest(root, state, dt.date.fromisoformat(key))))
+                            except OSError as exc:
+                                failures[key] = str(exc)
+                        print(json.dumps({'exports': exports, 'failures': failures}))
+                        return 2 if failures else 0
+                    print(export_digest(root, state, args.date or digest_date(now())))
                     return 0
                 if args.command == 'park':
                     job = active_job(state, token)
@@ -308,9 +368,7 @@ def main(argv=None):
             return 0
 
         history = load_review(args.review_all, args.respond_queue)
-        api = history.GitHub()
-        if api.get('user')['login'].casefold() != LOGIN:
-            raise ValueError('authenticated account must be alchambron')
+        api = authenticated_api(history)
         if args.command == 'plan':
             with slots.locked(root):
                 state = read_state(root)

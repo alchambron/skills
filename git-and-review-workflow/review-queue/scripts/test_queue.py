@@ -75,6 +75,18 @@ class QueueTests(unittest.TestCase):
                           '--thread', 'thread-link', '--host-ready', expected=expected)
         return json.loads(output)
 
+    def ledger(self, number, live):
+        pr = {'number': number, 'repository': queue.REPOSITORY, 'title': 'Example change',
+              'url': self.api.prs[number]['html_url'], 'head_sha': HEAD, 'base_sha': BASE,
+              'current_head_sha': HEAD, 'current_base_sha': BASE, 'review': {'status': 'clean'},
+              'publication': {'status': 'not_required'}, 'live': live, 'scenarios': []}
+        return {'version': 1, 'prs': [pr], 'login': 'alchambron', 'collected_at': queue.now().isoformat()}
+
+    def render(self, data):
+        ledger = self.run / 'results.json'
+        queue.save_json(ledger, data)
+        render_results.render(ledger, self.run / 'report')
+
     def test_event_reads_one_pr_directly_and_holds_other_reviewers_and_drafts(self):
         self.api.prs.update({13: pull(13, 'Kamyar-R'), 14: pull(14, draft=True)})
         selection = self.plan('--number', '12')
@@ -139,25 +151,81 @@ class QueueTests(unittest.TestCase):
         args = ['finish', '--token', token, '--status', 'completed']
         self.cli(*args, expected=2)
         self.cli(*args, '--cleanup-verified', expected=2)
-        pr = {'number': 12, 'repository': queue.REPOSITORY, 'title': 'Example change',
-              'url': self.api.prs[12]['html_url'], 'head_sha': HEAD, 'base_sha': BASE,
-              'current_head_sha': HEAD, 'current_base_sha': BASE, 'review': {'status': 'clean'},
-              'publication': {'status': 'not_required'}, 'live': {'status': 'complete'}, 'scenarios': []}
-        data = {'version': 1, 'prs': [pr], 'login': 'alchambron', 'collected_at': queue.now().isoformat()}
-        ledger = self.run / 'results.json'
-        queue.save_json(ledger, data)
-        render_results.render(ledger, self.run / 'report')
+        data = self.ledger(12, {'status': 'complete'})
+        self.render(data)
         self.cli(*args, '--cleanup-verified', expected=2)
-        pr['live'] = {'status': 'not_required', 'reason': 'Documentation-only change'}
-        queue.save_json(ledger, data)
-        render_results.render(ledger, self.run / 'report')
+        data['prs'][0]['live'] = {'status': 'not_required', 'reason': 'Documentation-only change'}
+        self.render(data)
+        self.api.prs[12]['requested_reviewers'] = []
         result = json.loads(self.cli(*args, '--cleanup-verified'))
         written = json.loads(Path(result['digest']).read_text())['reviews'][0]
         self.assertEqual((12, HEAD, 'completed', str(self.run / queue.REPORT)),
                          (written['pr'], written['head_sha'], written['outcome'], written['html_path']))
         self.assertEqual('#12 review ready, check before approving', written['ping'])
-        repeat = json.loads(self.cli(*args, '--cleanup-verified'))
+        with patch.object(queue, 'load_review', side_effect=AssertionError('offline')):
+            repeat = json.loads(self.cli(*args, '--cleanup-verified'))
         self.assertEqual(written['finished_at'], repeat['finished_at'])
+
+    def test_invalid_state_returns_deferred_without_overwriting(self):
+        self.state.mkdir()
+        path = self.state / 'state.json'
+        path.write_text('[]\n')
+        result = json.loads(self.cli('digest', expected=2))
+        self.assertEqual('deferred', result['status'])
+        self.assertIn('invalid review queue state', result['reason'])
+        self.assertEqual('[]\n', path.read_text())
+
+    def test_malformed_evidence_blocks_completion_but_releases_failed_job_offline(self):
+        self.plan('--number', '12')
+        token = self.claim()['token']
+        data = self.ledger(12, {'status': 'not_required'})
+        self.render(data)
+        data['prs'][0].update(review=None, live=[], publication={'status': []})
+        queue.save_json(self.run / 'results.json', data)
+        rendered = self.run / queue.REPORT.with_name('results.json')
+        report_data = json.loads(rendered.read_text())
+        report_data['prs'][0].update(live=None, publication=[])
+        queue.save_json(rendered, report_data)
+        args = ['finish', '--token', token, '--cleanup-verified', '--status']
+        self.cli(*args, 'completed', expected=2)
+        with patch.object(queue, 'load_review', side_effect=AssertionError('offline')):
+            result = json.loads(self.cli(*args, 'failed', '--reason', 'worker exited'))
+        self.assertEqual(('failed', 'pending'), (result['outcome'], result['verdict']))
+        self.assertIsNone(result['live'])
+        self.assertIsNone(result['publication'])
+        self.assertEqual('finished', queue.read_state(self.state)['jobs'][token]['status'])
+
+    def test_finish_reports_stale_head_or_base_as_blocked(self):
+        for number, revision in ((12, 'head'), (13, 'base')):
+            with self.subTest(revision=revision):
+                self.api.prs[number] = pull(number)
+                self.run = self.root / f'run-{number}'
+                self.plan('--number', str(number))
+                token = self.claim()['token']
+                self.render(self.ledger(number, {'status': 'not_required'}))
+                self.api.prs[number][revision]['sha'] = 'c' * 40
+                result = json.loads(self.cli('finish', '--token', token, '--status', 'completed', '--cleanup-verified'))
+                self.assertEqual(('blocked', HEAD, BASE), (result['outcome'], result['head_sha'], result['base_sha']))
+                self.assertEqual(f'#{number} review blocked, see report', result['ping'])
+                self.assertEqual('finished', queue.read_state(self.state)['jobs'][token]['status'])
+
+    def test_pending_digest_is_retried_offline_for_original_toronto_date(self):
+        self.plan('--number', '12')
+        token = self.claim()['token']
+        before_midnight = queue.dt.datetime.fromisoformat('2026-11-20T04:59:59+00:00')
+        with patch.object(queue, 'now', return_value=before_midnight), patch.object(queue, 'export', side_effect=OSError('disk full')):
+            self.cli('finish', '--token', token, '--status', 'failed', '--reason', 'worker exited',
+                     '--cleanup-verified', expected=2)
+        state = queue.read_state(self.state)
+        self.assertEqual('finished', state['jobs'][token]['status'])
+        self.assertEqual(['2026-11-19'], state['pending_digest_dates'])
+        after_midnight = queue.dt.datetime.fromisoformat('2026-11-20T05:00:01+00:00')
+        with patch.object(queue, 'now', return_value=after_midnight), patch.object(queue, 'load_review', side_effect=AssertionError('offline')):
+            result = json.loads(self.cli('digest', '--retry-pending'))
+            self.assertEqual([], json.loads(self.cli('digest', '--retry-pending'))['exports'])
+        path = self.state / 'digest/2026-11-19.json'
+        self.assertEqual({'exports': [str(path)], 'failures': {}}, result)
+        self.assertEqual(before_midnight.isoformat(), json.loads(path.read_text())['reviews'][0]['finished_at'])
 
 
 if __name__ == '__main__':

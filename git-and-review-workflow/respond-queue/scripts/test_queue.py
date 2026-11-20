@@ -5,6 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
+import select
 import subprocess
 import sys
 import tempfile
@@ -519,6 +520,7 @@ class SharedSlotProcessTests(Contexts):
         review = root/'review-queue'
         q.save(review/'state.json', {'jobs': {'first': {'number': 1, 'phase': 'static', 'status': 'active'}}})
         script = '''
+import fcntl
 import json
 from pathlib import Path
 import sys
@@ -527,6 +529,20 @@ sys.path.insert(0, sys.argv[1])
 from shared_slots import check_capacity, locked
 
 root, phase, number = Path(sys.argv[2]), sys.argv[3], int(sys.argv[4])
+original_flock = fcntl.flock
+
+def report_contention(handle, operation):
+    try:
+        original_flock(handle, operation | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print('blocked', flush=True)
+        original_flock(handle, operation)
+    else:
+        sys.exit('expected the other queue to hold the shared lock')
+
+if phase == 'analysis':
+    fcntl.flock = report_contention
+
 path = root / 'state.json'
 with locked(root):
     jobs = json.loads(path.read_text())['jobs'] if path.exists() else {}
@@ -534,20 +550,38 @@ with locked(root):
         check_capacity(root, root.name, phase, number, jobs.values())
     except ValueError as exc:
         sys.exit(str(exc))
+    if phase == 'static':
+        print('reserved', flush=True)
+        if sys.stdin.readline().strip() != 'commit':
+            sys.exit('parent did not release reservation')
     jobs[str(number)] = dict(number=number, phase=phase, status='active')
     path.write_text(json.dumps({'jobs': jobs}))
 '''
-        processes = []
-        for queue, phase, number in ((review, 'static', 2), (root/'respond-queue', 'analysis', 3)):
+        def start(queue, phase, number):
             process = self.enter(subprocess.Popen(
                 [sys.executable, '-B', '-c', script, str(Path(__file__).resolve().parent),
-                 str(queue), phase, str(number)], stderr=subprocess.PIPE, text=True,
+                 str(queue), phase, str(number)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True,
             ))
             self.addCleanup(process.kill)
-            processes.append(process)
-        errors = [process.communicate(timeout=10)[1] for process in processes]
-        self.assertEqual(sorted(process.returncode for process in processes), [0, 1], errors)
-        self.assertIn('shared static resource cap', ''.join(errors))
+            return process
+
+        def expect_signal(process, signal):
+            ready, _, _ = select.select([process.stdout], [], [], 10)
+            self.assertTrue(ready, f'child did not signal {signal}')
+            self.assertEqual(signal, process.stdout.readline().strip())
+
+        first = start(review, 'static', 2)
+        expect_signal(first, 'reserved')
+        second = start(root/'respond-queue', 'analysis', 3)
+        expect_signal(second, 'blocked')
+        self.assertIsNone(second.poll())
+        first.stdin.write('commit\n')
+        first.stdin.flush()
+        _, first_error = first.communicate(timeout=10)
+        _, second_error = second.communicate(timeout=10)
+        self.assertEqual((first.returncode, second.returncode), (0, 1), (first_error, second_error))
+        self.assertIn('shared static resource cap', second_error)
 
 
 if __name__ == '__main__': unittest.main()
