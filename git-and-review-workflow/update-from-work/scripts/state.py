@@ -163,6 +163,17 @@ def render_markdown(data):
         lines.append('## Updated')
         lines.extend(f"- #{row.get('number')} ({(row.get('head') or '')[:8]}) · CI {row.get('ci')}" for row in data['updated'])
         lines.append('')
+    if data['queue']:
+        lines.append('## Merge queue (top 5)')
+        for row in data['queue'][:5]:
+            prs = ', '.join(f'#{n}' for n in row.get('prs', []))
+            unresolved = row.get('unresolved_threads') or {}
+            note = ''
+            if unresolved:
+                total = sum(v for v in unresolved.values() if isinstance(v, int))
+                note = f' · {total} unresolved thread(s)'
+            lines.append(f"- {prs} (approved {row.get('approval_time', 'n/a')}){note}")
+        lines.append('')
     if data['skipped_conflicts']:
         lines.append('## Skipped conflicts')
         lines.extend(f"- #{row.get('number')}: {', '.join(row.get('files', []))}" for row in data['skipped_conflicts'])

@@ -118,44 +118,126 @@ def initialize(snapshot_path, output):
     return data
 
 
+def _upsert_scenario(pr, payload):
+    if not isinstance(payload, dict) or not payload.get("id"):
+        raise ValueError("Scenario requires a stable id")
+    existing = next((i for i, item in enumerate(pr["scenarios"]) if item["id"] == payload["id"]), None)
+    if existing is None:
+        pr["scenarios"].append(copy.deepcopy(payload))
+    else:
+        previous = pr["scenarios"][existing]
+        replacement = copy.deepcopy(payload)
+        if {key: value for key, value in previous.items() if key != "attempts"} == {key: value for key, value in replacement.items() if key != "attempts"}:
+            replacement = previous
+        else:
+            replacement["attempts"] = previous.get("attempts", []) + [
+                {key: value for key, value in previous.items() if key != "attempts"}]
+        pr["scenarios"][existing] = replacement
+
+
+def _apply_section(pr, base_sha, head_sha, section, payload):
+    if section == "cleanup":
+        record_cleanup(pr, base_sha, head_sha, payload)
+        return
+    if (pr.get("base_sha"), pr.get("head_sha")) != (base_sha, head_sha):
+        raise ValueError("PR/revision mismatch; refresh and review the intended pins before recording")
+    if section == "scenario":
+        _upsert_scenario(pr, payload)
+    elif section == "scenarios":
+        if not isinstance(payload, list):
+            raise ValueError("scenarios section requires a list of scenario objects")
+        for item in payload:
+            _upsert_scenario(pr, item)
+    elif section in SECTIONS:
+        pr[section] = copy.deepcopy(payload)
+    else:
+        raise ValueError("Unknown ledger section")
+    pr["updated_at"] = now()
+    # New evidence requires a new final refresh; retain previously recorded observations.
+    pr.pop("current_base_sha", None)
+    pr.pop("current_head_sha", None)
+
+
 def record(path, repository, number, base_sha, head_sha, section, payload):
     repository_parts(repository)
-    if section not in SECTIONS:
+    if section not in SECTIONS and section != "scenarios":
         raise ValueError("Unknown ledger section")
     with locked(path) as target:
         data = read(target)
         pr = next((item for item in data["prs"] if (item["repository"], item["number"]) == (repository, number)), None)
         if pr is None:
             raise ValueError("PR/revision mismatch; refresh and review the intended pins before recording")
-        if section == "cleanup":
-            record_cleanup(pr, base_sha, head_sha, payload)
-            save(target, data)
-            return data
-        if (pr.get("base_sha"), pr.get("head_sha")) != (base_sha, head_sha):
-            raise ValueError("PR/revision mismatch; refresh and review the intended pins before recording")
-        if section == "scenario":
-            if not isinstance(payload, dict) or not payload.get("id"):
-                raise ValueError("Scenario requires a stable id")
-            existing = next((i for i, item in enumerate(pr["scenarios"]) if item["id"] == payload["id"]), None)
-            if existing is None:
-                pr["scenarios"].append(payload)
-            else:
-                previous = pr["scenarios"][existing]
-                replacement = copy.deepcopy(payload)
-                if {key: value for key, value in previous.items() if key != "attempts"} == {key: value for key, value in replacement.items() if key != "attempts"}:
-                    replacement = previous
-                else:
-                    replacement["attempts"] = previous.get("attempts", []) + [
-                        {key: value for key, value in previous.items() if key != "attempts"}]
-                pr["scenarios"][existing] = replacement
-        else:
-            pr[section] = copy.deepcopy(payload)
-        pr["updated_at"] = now()
-        # New evidence requires a new final refresh; retain previously recorded observations.
-        pr.pop("current_base_sha", None)
-        pr.pop("current_head_sha", None)
+        _apply_section(pr, base_sha, head_sha, section, payload)
         save(target, data)
     return data
+
+
+def apply_batch(path, operations, *, base_dir=None):
+    """Apply a list of checkpoint operations in one locked, atomic ledger write."""
+    if not isinstance(operations, list) or not operations:
+        raise ValueError("apply requires a non-empty list of operations")
+    applied = 0
+    with locked(path) as target:
+        data = read(target)
+        for op in operations:
+            if not isinstance(op, dict):
+                raise ValueError("Each apply operation must be an object")
+            repository = op.get("repository")
+            number = op.get("number")
+            repository_parts(repository)
+            base_sha = None if op.get("base_sha") == "unavailable" else op.get("base_sha")
+            head_sha = None if op.get("head_sha") == "unavailable" else op.get("head_sha")
+            pr = next((item for item in data["prs"] if (item["repository"], item["number"]) == (repository, number)), None)
+            if pr is None:
+                raise ValueError("PR/revision mismatch; refresh and review the intended pins before recording")
+            if "sections" in op:
+                sections = op["sections"]
+                if not isinstance(sections, dict) or not sections:
+                    raise ValueError("sections must be a non-empty object")
+                for section, payload in sections.items():
+                    _apply_section(pr, base_sha, head_sha, section, payload)
+                    applied += 1
+            else:
+                section = op.get("section")
+                if "data_file" in op:
+                    source = Path(op["data_file"])
+                    if not source.is_absolute() and base_dir is not None:
+                        source = Path(base_dir) / source
+                    payload = json.loads(source.read_text(encoding="utf-8"))
+                elif "data" in op:
+                    payload = op["data"]
+                else:
+                    raise ValueError("Operation requires data, data_file, or sections")
+                _apply_section(pr, base_sha, head_sha, section, payload)
+                applied += 1
+        save(target, data)
+    return data, applied
+
+
+def summarize_ledger(path):
+    """Return a compact per-PR status projection without dumping full findings or scenario prose."""
+    data = read(path)
+    rows = []
+    for pr in data["prs"]:
+        counts = {}
+        for item in pr.get("scenarios", []):
+            counts[item["status"]] = counts.get(item["status"], 0) + 1
+        rows.append({
+            "repository": pr["repository"],
+            "number": pr["number"],
+            "base_sha": pr.get("base_sha"),
+            "head_sha": pr.get("head_sha"),
+            "fresh": (pr.get("current_base_sha") == pr.get("base_sha")
+                      and pr.get("current_head_sha") == pr.get("head_sha")),
+            "review": (pr.get("review") or {}).get("status"),
+            "findings": len((pr.get("review") or {}).get("findings", [])),
+            "publication": (pr.get("publication") or {}).get("status"),
+            "live": (pr.get("live") or {}).get("status"),
+            "scenarios": counts,
+            "review_request": (pr.get("review_request") or {}).get("status"),
+            "pending_cleanup": len(pr.get("pending_cleanup", [])),
+        })
+    return {"prs": rows, "pr_count": len(rows), "collected_at": data.get("collected_at"), "resumed_at": data.get("resumed_at")}
 
 
 def record_cleanup(pr, base_sha, head_sha, payload):
@@ -391,8 +473,13 @@ def main(argv=None):
     update.add_argument("--number", required=True, type=int)
     update.add_argument("--base-sha", required=True)
     update.add_argument("--head-sha", required=True)
-    update.add_argument("--section", required=True, choices=SECTIONS)
+    update.add_argument("--section", required=True, choices=(*SECTIONS, "scenarios"))
     update.add_argument("--data", required=True, type=Path)
+    batch = commands.add_parser("apply", help="Atomically apply a batch of section/scenario updates from a JSON file")
+    batch.add_argument("--input", required=True, type=Path)
+    batch.add_argument("--ops", required=True, type=Path)
+    proj = commands.add_parser("summary", help="Print a compact per-PR ledger status summary without dumping full text")
+    proj.add_argument("--input", required=True, type=Path)
     transfer = commands.add_parser("carry", help="Copy earlier outcomes to PRs selected in carry mode")
     transfer.add_argument("--input", required=True, type=Path)
     refresh = commands.add_parser("resume", help="Refresh saved PRs and reconcile publication without posting")
@@ -402,6 +489,14 @@ def main(argv=None):
     try:
         if args.command == "carry":
             print(json.dumps(carry(args.input)))
+            return 0
+        if args.command == "summary":
+            print(json.dumps(summarize_ledger(args.input)))
+            return 0
+        if args.command == "apply":
+            ops = json.loads(args.ops.read_text(encoding="utf-8"))
+            data, applied = apply_batch(args.input, ops, base_dir=args.ops.resolve().parent)
+            print(json.dumps({"prs": len(data["prs"]), "applied": applied, "command": "apply"}))
             return 0
         if args.command == "init":
             data = initialize(args.snapshot, args.output)

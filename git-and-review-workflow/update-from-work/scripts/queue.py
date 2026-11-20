@@ -17,14 +17,25 @@ def stamp(value):
     return result
 
 
+def is_human_reviewer(review):
+    login = (review.get('login') or '').casefold()
+    return (review.get('type') == 'User' and bool(login) and login != 'alchambron'
+            and not any(word in login for word in ('[bot]', 'copilot', 'coderabbit')))
+
+
 def approval(pr):
+    # GitHub returns reviewDecision=null when a ruleset requires review-thread
+    # resolution on an otherwise human-approved PR. Admit APPROVED or null/empty
+    # only when at least one human currently approves and no human currently
+    # requests changes; REVIEW_REQUIRED and CHANGES_REQUESTED stay excluded.
     if not (pr['author'] == 'alchambron' and pr['repo'] == 'EnerZam/JouleMV'
             and pr['head_repo'] == 'EnerZam/JouleMV' and pr['state'] == 'OPEN'
-            and not pr['draft'] and pr['reviewDecision'] == 'APPROVED'):
+            and not pr['draft'] and pr['reviewDecision'] in ('APPROVED', None, '')):
         return None
-    times = [stamp(r['submittedAt']) for r in pr['reviews']
-             if r['state'] == 'APPROVED' and r['type'] == 'User'
-             and r['login'] != 'alchambron' and not r['login'].endswith('[bot]')]
+    humans = [r for r in pr['reviews'] if is_human_reviewer(r)]
+    if any(r['state'] == 'CHANGES_REQUESTED' for r in humans):
+        return None
+    times = [stamp(r['submittedAt']) for r in humans if r['state'] == 'APPROVED']
     return min(times) if times else None
 
 
@@ -70,8 +81,13 @@ def build_queue(prs):
             remaining.difference_update(ready)
         if any(nodes[i]['base'] != 'work' and parents[i] is None for i in component):
             continue
-        result.append(dict(prs=ordered, approval_time=max(times.values()).isoformat(),
-                           urls=[f'https://github.com/EnerZam/JouleMV/pull/{i}' for i in ordered]))
+        entry = dict(prs=ordered, approval_time=max(times.values()).isoformat(),
+                     urls=[f'https://github.com/EnerZam/JouleMV/pull/{i}' for i in ordered])
+        unresolved = {str(i): nodes[i]['unresolved_threads'] for i in ordered
+                      if isinstance(nodes[i].get('unresolved_threads'), int) and nodes[i]['unresolved_threads'] > 0}
+        if unresolved:
+            entry['unresolved_threads'] = unresolved
+        result.append(entry)
     return sorted(result, key=lambda e: (stamp(e['approval_time']), e['prs']))
 
 
