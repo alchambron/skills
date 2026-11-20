@@ -515,6 +515,53 @@ class CliTests(Contexts):
         self.assertFalse(q.is_signoff_hold([TRIGGER], [dict(review(), body=hold_body + ' Can you also rename this?')]))
         self.assertFalse(q.is_signoff_hold([TRIGGER], [dict(review(), body='Please fix the bug.')]))
 
+    def test_update_from_work_reservation_gates_respond_fixer_and_same_pr(self):
+        updater_root = self.root/'update-from-work'
+        updater_root.mkdir()
+        (updater_root/'state.json').write_text(json.dumps({'jobs': {
+            'upd': {'status': 'active', 'phase': 'update', 'number': 1},
+        }}))
+        code, out = self.claim('analysis')
+        self.assertEqual(code, 2)
+        self.assertIn('reserved by update-from-work', out['reason'])
+
+        (updater_root/'state.json').write_text(json.dumps({'jobs': {
+            'upd': {'status': 'active', 'phase': 'update', 'number': 99},
+        }}))
+        code, out = self.claim('analysis')
+        self.assertEqual(code, 0)
+        self.assertEqual(self.finish(out['token'], {'status': 'analyzed'}), 0)
+        code, out = self.claim('fix')
+        self.assertEqual(code, 2)
+        self.assertIn('shared live resource cap', out['reason'])
+
+    def test_handoff_kind_classification_and_dated_digest_retry(self):
+        self.assertEqual(q.infer_handoff_kind('Pure sign-off hold; awaiting human sign-off.'), 'external_hold')
+        self.assertEqual(q.infer_handoff_kind('Hosted CI is missing on the pushed head.'), 'infra_blocked')
+        self.assertEqual(q.infer_handoff_kind('Migration placement requires stack decision.'), 'needs_decision')
+        self.assertEqual(q.infer_handoff_kind('Any reason', 'external_hold'), 'external_hold')
+        with self.assertRaises(ValueError):
+            q.infer_handoff_kind('Any reason', 'bogus')
+
+        self.finish(self.claim()[1]['token'], {'status': 'analyzed'})
+        with mock.patch.object(q, 'export_dated_digest', side_effect=OSError('disk full')):
+            code, _ = run('--state', str(self.state), 'handoff', '--number', '1', '--batch', BATCH,
+                          '--reason', 'Actions spending limit blocked CI')
+        self.assertEqual(code, 0)
+        st = self.state_data()
+        self.assertEqual(st['batches'][f'1:{BATCH}']['handoff_kind'], 'infra_blocked')
+        self.assertEqual(len(st['pending_digest_dates']), 1)
+
+        code, out = run('--state', str(self.state), 'digest', '--retry-pending')
+        self.assertEqual(code, 0)
+        retried = json.loads(out)
+        self.assertEqual(retried['failures'], {})
+        self.assertEqual(len(retried['exports']), 1)
+        dated = json.loads(Path(retried['exports'][0]).read_text())
+        self.assertEqual(len(dated['handoffs_by_kind']['infra_blocked']), 1)
+        self.assertIn('Blocked by CI / infrastructure', Path(retried['exports'][0]).with_suffix('.md').read_text())
+        self.assertEqual(self.state_data()['pending_digest_dates'], [])
+
     def test_digest_mixed_schema_atomic_and_bounded(self):
         self.state.mkdir()
         legacy = {'schema_version': 1,

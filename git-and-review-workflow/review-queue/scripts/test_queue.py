@@ -134,6 +134,19 @@ class QueueTests(unittest.TestCase):
         self.api.prs[12]['requested_reviewers'] = [{'login': 'Kamyar-R'}]
         self.assertIn('no longer directly requested', self.cli('guard', '--token', token, expected=2))
 
+    def test_update_from_work_live_slot_gates_review_queue_live_and_same_pr(self):
+        updater = self.root / 'update-from-work/state.json'
+        queue.save_json(updater, {'jobs': {'upd': {'status': 'active', 'phase': 'update', 'number': 12}}})
+        self.plan('--number', '12')
+        self.assertIn('reserved by update-from-work', self.claim(expected=2)['reason'])
+
+        queue.save_json(updater, {'jobs': {'upd': {'status': 'active', 'phase': 'update', 'number': 99}}})
+        token = self.claim()['token']
+        self.cli('park', '--token', token)
+        self.assertIn('shared live resource cap', self.cli('claim-live', '--token', token, '--host-ready', expected=2))
+        updater.unlink()
+        self.cli('claim-live', '--token', token, '--host-ready')
+
     def test_changes_in_pins_and_stale_attempts_require_replanning(self):
         self.plan('--number', '12')
         self.api.prs[12]['head']['sha'] = 'c' * 40

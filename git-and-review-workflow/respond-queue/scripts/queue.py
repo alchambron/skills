@@ -20,15 +20,18 @@ import re
 import subprocess
 import sys
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY = 'EnerZam/JouleMV'
 LOGIN = 'alchambron'
+TORONTO = ZoneInfo('America/Toronto')
 DEFAULT_STATE = Path.home()/'.codex/review-state/respond-queue'
 INTEGRATION_BRANCHES = ('work',)
 TERMINAL = ('completed', 'handoff', 'skipped')
 SETTLED_CI = ('passed', 'failed', 'missing')
+HANDOFF_KINDS = ('external_hold', 'infra_blocked', 'needs_decision')
 SKIP_LIMIT = 200
 SEMVER = re.compile(r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)')
 SHA = re.compile(r'[0-9a-f]{40}')
@@ -41,9 +44,19 @@ SIGN_OFF_HOLD = re.compile(
     re.IGNORECASE,
 )
 HOLD_REASON = 'Pure sign-off hold (no code change requested); awaiting human sign-off.'
+EXTERNAL_HOLD_RE = re.compile(
+    r'sign-off hold|approval hold|pure sign-off hold|awaiting human sign-off|'
+    r'names no (?:code|change|repair)|named no repair|identified no code correction',
+    re.IGNORECASE,
+)
+INFRA_BLOCKED_RE = re.compile(
+    r'billing|spending limit|ci (?:is )?missing|hosted (?:github actions )?ci is missing|'
+    r'zero workflow runs|zero actions runs|infrastructure|offline|mac busy|host unavailable|github unavailable',
+    re.IGNORECASE,
+)
 BATCH_DEFAULTS = dict(number=None, feedback_batch=None, head=None, fix_rounds=0, status='unknown',
                       actions=[], commits=[], replies=[], re_request={}, ci={'state': 'unknown'},
-                      handoff_reason=None)
+                      handoff_reason=None, handoff_kind=None)
 JOB_DEFAULTS = dict(number=None, phase=None, head=None, batch_key=None, run_dir=None, thread=None,
                     status='unknown', started_at=None)
 
@@ -93,6 +106,27 @@ def companions(respond_all, respond):
 
 def stamp():
     return datetime.now(timezone.utc).isoformat()
+
+
+def digest_date(timestamp):
+    if isinstance(timestamp, str):
+        timestamp = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+    if timestamp.utcoffset() is None:
+        raise ValueError('digest timestamps must include a timezone')
+    return timestamp.astimezone(TORONTO).date()
+
+
+def infer_handoff_kind(reason, explicit=None):
+    if explicit is not None:
+        if explicit not in HANDOFF_KINDS:
+            raise ValueError(f'handoff_kind must be one of {", ".join(HANDOFF_KINDS)}')
+        return explicit
+    text = str(reason or '')
+    if EXTERNAL_HOLD_RE.search(text):
+        return 'external_hold'
+    if INFRA_BLOCKED_RE.search(text):
+        return 'infra_blocked'
+    return 'needs_decision'
 
 
 def api(endpoint):
@@ -236,8 +270,9 @@ def ledger_entry(ledger_module, run_dir, number, batch):
 def locked(root):
     with shared_slots.locked(root):
         path = root/'state.json'
-        state = json.loads(path.read_text()) if path.exists() else {'schema_version': 1, 'jobs': {}, 'batches': {}, 'skips': []}
-        for key, value in (('jobs', {}), ('batches', {}), ('skips', [])):
+        state = json.loads(path.read_text()) if path.exists() else {
+            'schema_version': 1, 'jobs': {}, 'batches': {}, 'skips': [], 'pending_digest_dates': []}
+        for key, value in (('jobs', {}), ('batches', {}), ('skips', []), ('pending_digest_dates', [])):
             state.setdefault(key, value)
         yield state
         state['skips'] = state['skips'][-SKIP_LIMIT:]
@@ -371,8 +406,11 @@ def finish(state, token, outcome, cleanup):
         record['re_request'] = outcome['re_request']
     if isinstance(ci, dict):
         record['ci'] = ci
-    record.update(status=status, handoff_reason=outcome.get('reason') if status == 'handoff' else
-                  record.get('handoff_reason'), updated_at=stamp())
+    if status == 'handoff':
+        kind = infer_handoff_kind(outcome.get('reason'), outcome.get('handoff_kind'))
+        record.update(status=status, handoff_reason=outcome.get('reason'), handoff_kind=kind, updated_at=stamp())
+    else:
+        record.update(status=status, handoff_reason=record.get('handoff_reason'), updated_at=stamp())
     if status == 'skipped':
         record['skip_reason'] = outcome['reason']
     job.update(status='finished', finished_at=stamp())
@@ -402,14 +440,15 @@ def observe_ci(state, number, batch, head, ci):
     record.update(ci=ci, status='ci_settled', updated_at=stamp())
 
 
-def handoff(state, number, batch, reason):
+def handoff(state, number, batch, reason, kind=None):
     require_idle(state, number)
     record = batch_record(state, number, batch)
     if record['status'] in TERMINAL:
         raise ValueError(f'batch already terminal ({record["status"]})')
     if not reason.strip():
         raise ValueError('handoff reason required')
-    record.update(status='handoff', handoff_reason=reason, updated_at=stamp())
+    resolved_kind = infer_handoff_kind(reason, kind)
+    record.update(status='handoff', handoff_reason=reason, handoff_kind=resolved_kind, updated_at=stamp())
 
 
 def complete(state, number, batch, entry, settled):
@@ -437,31 +476,104 @@ def normalized(rows, defaults, key=None):
         merged = {**copy.deepcopy(defaults), **row}
         if key:
             merged.setdefault(key, name)
+        if merged.get('status') == 'handoff' and not merged.get('handoff_kind'):
+            merged['handoff_kind'] = infer_handoff_kind(merged.get('handoff_reason'))
         result.append(merged)
     return result
 
 
-def digest(state):
+def handoffs_grouped(prs):
+    grouped = {kind: [] for kind in HANDOFF_KINDS}
+    for row in prs:
+        if row.get('status') == 'handoff':
+            kind = row.get('handoff_kind') if row.get('handoff_kind') in grouped else infer_handoff_kind(row.get('handoff_reason'))
+            grouped[kind].append(row)
+    return grouped
+
+
+def digest(state, day=None):
     jobs = normalized(state.get('jobs', {}).items(), JOB_DEFAULTS, 'token')
-    skips = [s if isinstance(s, dict) else {'reason': str(s)} for s in state.get('skips', [])][-SKIP_LIMIT:]
-    return {'schema_version': 1, 'generated_at': stamp(), 'repository': REPOSITORY,
-            'prs': normalized(state.get('batches', {}).items(), BATCH_DEFAULTS),
-            'reservations': jobs, 'skips': skips,
-            'source': 'Recorded evidence; not a live CI refresh'}
+    all_prs = normalized(state.get('batches', {}).items(), BATCH_DEFAULTS)
+    all_skips = [s if isinstance(s, dict) else {'reason': str(s)} for s in state.get('skips', [])][-SKIP_LIMIT:]
+    if day is not None:
+        prs = [
+            row for row in all_prs
+            if row.get('status') not in TERMINAL
+            or (row.get('updated_at') and digest_date(row['updated_at']) == day)
+        ]
+        skips = [s for s in all_skips if s.get('at') and digest_date(s['at']) == day]
+        reservations = [j for j in jobs if j.get('status') == 'active']
+    else:
+        prs, skips, reservations = all_prs, all_skips, jobs
+    payload = {'schema_version': 1, 'generated_at': stamp(), 'repository': REPOSITORY,
+               'prs': prs, 'handoffs_by_kind': handoffs_grouped(prs),
+               'reservations': reservations, 'skips': skips,
+               'source': 'Recorded evidence; not a live CI refresh'}
+    if day is not None:
+        payload['date'] = day.isoformat()
+    return payload
+
+
+def _pr_line(r):
+    ci = r.get('ci') if isinstance(r.get('ci'), dict) else {}
+    kind = f" [{r['handoff_kind']}]" if r.get('status') == 'handoff' and r.get('handoff_kind') else ''
+    return (f"- #{r.get('number')}: {r.get('status')}{kind}; rounds {r.get('fix_rounds')}/2; "
+            f"CI {ci.get('state')} {(ci.get('head') or '')[:8]}; {r.get('handoff_reason') or ''}").rstrip()
 
 
 def digest_markdown(data):
-    lines = ['# Respond queue', '', data['generated_at'], '']
-    for r in data['prs']:
-        ci = r.get('ci') if isinstance(r.get('ci'), dict) else {}
-        lines.append(f"- #{r.get('number')}: {r.get('status')}; rounds {r.get('fix_rounds')}/2; "
-                     f"CI {ci.get('state')} {(ci.get('head') or '')[:8]}; {r.get('handoff_reason') or ''}".rstrip())
-    for j in data['reservations']:
+    header = f"# Respond queue for {data['date']}" if data.get('date') else '# Respond queue'
+    lines = [header, '', data['generated_at'], '']
+    grouped = data.get('handoffs_by_kind') or handoffs_grouped(data.get('prs', []))
+    sections = (
+        ("Needs Alexis's decision", grouped.get('needs_decision', [])),
+        ('Waiting on external sign-off', grouped.get('external_hold', [])),
+        ('Blocked by CI / infrastructure', grouped.get('infra_blocked', [])),
+    )
+    for title, rows in sections:
+        if rows:
+            lines.extend([f'## {title}', ''])
+            lines.extend(_pr_line(r) for r in rows)
+            lines.append('')
+    other = [r for r in data.get('prs', []) if r.get('status') != 'handoff']
+    if other:
+        lines.extend(['## Completed and in progress', ''])
+        lines.extend(_pr_line(r) for r in other)
+        lines.append('')
+    for j in data.get('reservations', []):
         if j.get('status') == 'active':
             lines.append(f"- Active {j.get('phase')} #{j.get('number')} thread {j.get('thread')} token {j.get('token')}")
-    for s in data['skips'][-20:]:
+    for s in data.get('skips', [])[-20:]:
         lines.append(f"- Skip: {s.get('url') or s.get('command') or ''} {s.get('reason')}".rstrip())
-    return '\n'.join(lines) + '\n'
+    return '\n'.join(lines).rstrip() + '\n'
+
+
+def export_dated_digest(root, state, day):
+    data = digest(state, day=day)
+    directory = root / 'digest'
+    directory.mkdir(parents=True, exist_ok=True)
+    target = directory / f'{day.isoformat()}.json'
+    write_atomic(directory / f'{day.isoformat()}.md', digest_markdown(data))
+    save(target, data)
+    key = day.isoformat()
+    if key in state.get('pending_digest_dates', []):
+        state['pending_digest_dates'].remove(key)
+    return target
+
+
+def record_pending_date(state, day):
+    key = day.isoformat()
+    if key not in state['pending_digest_dates']:
+        state['pending_digest_dates'].append(key)
+
+
+def try_export_today(root, state):
+    day = digest_date(datetime.now(timezone.utc))
+    record_pending_date(state, day)
+    try:
+        export_dated_digest(root, state, day)
+    except OSError:
+        pass
 
 
 def main(argv=None):
@@ -489,29 +601,46 @@ def main(argv=None):
     p = sub.add_parser('handoff')
     p.add_argument('--number', type=int, required=True); p.add_argument('--batch', required=True)
     p.add_argument('--reason', required=True)
-    sub.add_parser('digest')
+    p.add_argument('--kind', choices=HANDOFF_KINDS)
+    d = sub.add_parser('digest').add_mutually_exclusive_group()
+    d.add_argument('--date', type=date.fromisoformat)
+    d.add_argument('--retry-pending', action='store_true')
     args = parser.parse_args(argv)
     try:
         if args.command == 'digest':
             with locked(args.state) as state:
+                if args.retry_pending:
+                    exports, failures = [], {}
+                    for key in list(state['pending_digest_dates']):
+                        try:
+                            exports.append(str(export_dated_digest(args.state, state, date.fromisoformat(key))))
+                        except OSError as exc:
+                            failures[key] = str(exc)
+                    print(json.dumps({'exports': exports, 'failures': failures}))
+                    return 2 if failures else 0
                 data = digest(state)
                 save(args.state/'digest-index.json', data)
                 write_atomic(args.state/'digest.md', digest_markdown(data))
-            print(args.state/'digest-index.json'); return 0
+                target_day = args.date or digest_date(datetime.now(timezone.utc))
+                dated_path = export_dated_digest(args.state, state, target_day)
+            print(dated_path if args.date else args.state/'digest-index.json'); return 0
         if args.command == 'observe-ci':
             ci = json.loads(args.ci.read_text())
             with locked(args.state) as state:
                 observe_ci(state, args.number, args.batch, args.head, ci)
+                try_export_today(args.state, state)
             return 0
         if args.command == 'handoff':
             with locked(args.state) as state:
-                handoff(state, args.number, args.batch, args.reason)
+                handoff(state, args.number, args.batch, args.reason, args.kind)
+                try_export_today(args.state, state)
             return 0
         if args.command == 'complete':
             _, history, _ = companions(args.respond_all, args.respond)
             entry = ledger_entry(history.ledger, args.run_dir, args.number, args.batch)
             with locked(args.state) as state:
                 complete(state, args.number, args.batch, entry, history.settled)
+                try_export_today(args.state, state)
             return 0
         if args.command == 'finish':
             outcome = json.loads(args.outcome.read_text())
@@ -519,6 +648,7 @@ def main(argv=None):
                 raise ValueError('outcome must be a JSON object')
             with locked(args.state) as state:
                 finish(state, args.token, outcome, args.cleanup_verified)
+                try_export_today(args.state, state)
             return 0
         collector, history, snapshotter = companions(args.respond_all, args.respond)
         if api('user').get('login', '').casefold() != LOGIN:
@@ -551,9 +681,11 @@ def main(argv=None):
                         state['batches'][key] = dict(
                             copy.deepcopy(BATCH_DEFAULTS), number=row['number'],
                             feedback_batch=row['feedback_batch'], head=row['headSha'],
-                            status='handoff', handoff_reason=HOLD_REASON, updated_at=stamp(),
+                            status='handoff', handoff_reason=HOLD_REASON, handoff_kind='external_hold',
+                            updated_at=stamp(),
                         )
                         skipped.append({'url': row['url'], 'reason': HOLD_REASON, 'head': row['headSha']})
+                        try_export_today(args.state, state)
                     else:
                         existing = state['batches'][key]
                         skipped.append({'url': row['url'],
