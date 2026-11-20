@@ -17,7 +17,7 @@ The top-level object contains `version: 1`, `login`, `collected_at`, optional `c
 - `revision_history`: archived pins, evidence and outcomes invalidated by revision drift. `pending_cleanup` retains old runtime receipts whose owned resources still need cleanup. Preserve these until absence is verified.
 - `scenarios`: an array of records below. Every selected PR appears even if review, publication, startup, or testing fails.
 
-Plan scenarios during static review, including for PRs with defects. Record unexecuted/deferred scenarios as `blocked` and explain their dependency or prerequisite in `actual`. Update the same ID when execution becomes possible.
+Plan scenarios once static review is clean. When static review publishes (or reuses) verified `REQUEST_CHANGES`, skip scenario planning and live acceptance and record `live: {"status": "not_required", "reason": "Static review published verified REQUEST_CHANGES; live acceptance waits for the author's fix"}`. For clean PRs, record any unexecuted/deferred scenarios as `blocked` and explain their dependency or prerequisite in `actual`. Update the same ID when execution becomes possible.
 
 Each scenario has a stable `id` unique within its PR, `title`, `preconditions`, `route`, `steps` array, `expected`, `actual`, and `status`. Its full identity is `repository` + PR `number` + scenario `id`; another PR may reuse the same scenario ID. Status is one of `pass`, `fail`, `blocked`, `observed`, `partial`, or `spec_gap`. Preconditions/expected/actual may be text or structured JSON. Also retain:
 
@@ -42,7 +42,14 @@ Use the helper's `--help` for current options. Initialize once from the selected
 python3 "$SKILL_DIR/scripts/ledger.py" init --snapshot "$RUN_DIR/snapshot.json" --output "$RUN_DIR/results.json"
 ```
 
-Write each section's JSON payload to an owned file, then record it against the exact pinned revision:
+Write each section's JSON payload to an owned file, then record it against the exact pinned revision—prefer `ledger.py apply` to batch all sections and scenarios for a phase transition into one atomic write, and use `ledger.py summary --input "$RUN_DIR/results.json"` for compact status reads:
+
+```sh
+python3 "$SKILL_DIR/scripts/ledger.py" apply --input "$RUN_DIR/results.json" --ops "$RUN_DIR/ops.json"
+python3 "$SKILL_DIR/scripts/ledger.py" summary --input "$RUN_DIR/results.json"
+```
+
+Single-section writes remain supported via `record`:
 
 ```sh
 python3 "$SKILL_DIR/scripts/ledger.py" record --input "$RUN_DIR/results.json" \
@@ -51,7 +58,7 @@ python3 "$SKILL_DIR/scripts/ledger.py" record --input "$RUN_DIR/results.json" \
   --section scenario --data "$RUN_DIR/scenario-result.json"
 ```
 
-Sections are `review`, `publication`, `live`, `scenario`, `coverage_gaps` and archived `cleanup`. Section payloads replace that section; a scenario upserts its stable ID. A pin mismatch refuses the write. For inaccessible pins, pass the literal `unavailable` instead of a SHA. To resolve an archived runtime, use `--section cleanup` with its old base/head pins and a payload containing `database_dropped`, `servers_stopped` and `worktree_removed`, each boolean or null. Partial receipts stay pending; all three true clears the pending item while retaining history. Record publication only after the publishing skill's full GitHub readback. Save reference URLs even when a submission outcome is uncertain, so recovery checks them before another write.
+Sections are `review`, `publication`, `live`, `scenario`, `scenarios` (list upsert), `coverage_gaps` and archived `cleanup`. Each entry in `ops.json` accepts `repository`, `number`, `base_sha`, `head_sha`, and either `sections: {...}` or `section` with inline `data` / `data_file`. Section payloads replace that section; a scenario upserts its stable ID. A pin mismatch refuses the entire batch atomically. For inaccessible pins, pass the literal `unavailable` instead of a SHA. To resolve an archived runtime, use `--section cleanup` with its old base/head pins and a payload containing `database_dropped`, `servers_stopped` and `worktree_removed`, each boolean or null. Partial receipts stay pending; all three true clears the pending item while retaining history. Record publication only after the publishing skill's full GitHub readback. Save reference URLs even when a submission outcome is uncertain, so recovery checks them before another write.
 
 ```sh
 python3 "$SKILL_DIR/scripts/ledger.py" resume --input "$RUN_DIR/results.json"

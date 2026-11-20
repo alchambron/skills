@@ -48,3 +48,14 @@ class QueueTests(unittest.TestCase):
         self.assertEqual([e['prs'] for e in selected_dedup], [[2], [4], [5]])
         with self.assertRaises(ValueError):
             select_candidates(queue, needs_update=[1], limit=4)
+
+    def test_null_review_decision_with_human_approval_and_no_changes_requested_qualifies(self):
+        approved_null = {**pr(10, 2, decision=None), 'unresolved_threads': 2}
+        blocked_null = pr(11, 1, decision=None)
+        blocked_null['reviews'].append(dict(login='bob', type='User', state='CHANGES_REQUESTED',
+                                            submittedAt='2026-11-03T12:00:00Z'))
+        review_req = pr(12, 1, decision='REVIEW_REQUIRED')
+        bot_only_null = pr(13, 1, decision=None, kind='Bot')
+        queue = build_queue([approved_null, blocked_null, review_req, bot_only_null])
+        self.assertEqual([e['prs'] for e in queue], [[10]])
+        self.assertEqual(queue[0]['unresolved_threads'], {'10': 2})

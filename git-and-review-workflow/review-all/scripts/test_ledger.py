@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import patch
 
 from collect_reviews import CollectionError
-from ledger import carry, initialize, record, resume, save
+from ledger import apply_batch, carry, initialize, main as ledger_main, record, resume, save, summarize_ledger
 from render_results import prepare
 from test_render_results import ledger, scenario
 
@@ -275,6 +275,52 @@ class LedgerTests(unittest.TestCase):
         result = resume(self.path, api)["prs"][0]
         self.assertEqual(api.calls, [])
         self.assertIn("host", result["resume_error"])
+
+    def test_apply_batch_updates_sections_and_scenarios_atomically_and_summarizes(self):
+        extra = self.root / "extra-scenario.json"
+        extra.write_text(json.dumps(scenario("check-2", status="fail")))
+        ops = [
+            {
+                "repository": "Example/Application",
+                "number": 7,
+                "base_sha": "a" * 40,
+                "head_sha": "b" * 40,
+                "sections": {
+                    "review": {"status": "clean", "findings": [], "standards": [], "spec": [], "limits": []},
+                    "publication": {"status": "not_required"},
+                    "scenarios": [scenario("check-1", status="pass")],
+                },
+            },
+            {
+                "repository": "Example/Application",
+                "number": 7,
+                "base_sha": "a" * 40,
+                "head_sha": "b" * 40,
+                "section": "scenario",
+                "data_file": "extra-scenario.json",
+            },
+        ]
+        data, applied = apply_batch(self.path, ops, base_dir=self.root)
+        self.assertEqual(applied, 4)
+        self.assertEqual([s["id"] for s in data["prs"][0]["scenarios"]], ["check-1", "check-2"])
+        self.assertNotIn("current_head_sha", data["prs"][0])
+
+        # Pin mismatch on a later op aborts the whole batch without mutating disk.
+        before = self.path.read_bytes()
+        bad_ops = [
+            {"repository": "Example/Application", "number": 7, "base_sha": "a" * 40, "head_sha": "b" * 40,
+             "section": "review", "data": {"status": "blocked", "findings": [], "standards": [], "spec": [], "limits": []}},
+            {"repository": "Example/Application", "number": 7, "base_sha": "a" * 40, "head_sha": "c" * 40,
+             "section": "publication", "data": {"status": "failed"}},
+        ]
+        with self.assertRaisesRegex(ValueError, "revision mismatch"):
+            apply_batch(self.path, bad_ops)
+        self.assertEqual(self.path.read_bytes(), before)
+
+        summary = summarize_ledger(self.path)
+        self.assertEqual(summary["pr_count"], 1)
+        self.assertEqual(summary["prs"][0]["scenarios"], {"pass": 1, "fail": 1})
+        self.assertFalse(summary["prs"][0]["fresh"])
 
 
 
