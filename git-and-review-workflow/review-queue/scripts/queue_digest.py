@@ -25,7 +25,10 @@ def review_result(token, job, result):
     outcome = result['status']
     path = result['html_path']
     if outcome == 'completed' and path:
-        ping = f'#{number} review ready, check before approving'
+        if result.get('verdict') == 'issues':
+            ping = f'#{number} changes requested, see report'
+        else:
+            ping = f'#{number} review ready, check before approving'
     else:
         label = 'incomplete' if outcome == 'completed' else outcome
         detail = 'see report' if path else 'report unavailable'

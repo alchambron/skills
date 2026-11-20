@@ -8,6 +8,7 @@ The command prints JSON so a review thread can pass frontendUrl to T3 preview.
 """
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import fcntl
 import hashlib
 import json
@@ -29,8 +30,12 @@ from urllib.request import urlopen
 
 ROOT = Path.cwd().resolve()
 KEY = hashlib.sha256(str(ROOT).encode()).hexdigest()[:14]
-STATE_DIR = Path.home() / ".cache" / "joulemv-agent-run" / KEY
+CACHE_ROOT = Path.home() / ".cache" / "joulemv-agent-run"
+STATE_DIR = CACHE_ROOT / KEY
 STATE_FILE = STATE_DIR / "state.json"
+WAR_CACHE_DIR = CACHE_ROOT / "war-cache"
+WAR_CACHE_LIMIT = 5
+PG_PARALLEL_JOBS = max(1, min(4, os.cpu_count() or 1))
 DB_PATTERN = re.compile(r"^jmv_ai_[0-9a-f]{14}$")
 LOOPBACK = {"localhost", "127.0.0.1", "::1"}
 
@@ -159,10 +164,12 @@ def java_env():
                       (version_number, version_number))
 
 
-def preflight():
-    if not (ROOT / "AGENT.md").is_file() or not (ROOT / "pom.xml").is_file() or not (ROOT / "frontend/package-lock.json").is_file():
+def preflight(skip_frontend=False):
+    if not (ROOT / "AGENT.md").is_file() or not (ROOT / "pom.xml").is_file() or (
+            not skip_frontend and not (ROOT / "frontend/package-lock.json").is_file()):
         raise LaunchError("Run this command from a JouleMV worktree root")
-    for name in ("git", "mvn", "npm"):
+    required_commands = ("git", "mvn") if skip_frontend else ("git", "mvn", "npm")
+    for name in required_commands:
         if not shutil.which(name):
             raise LaunchError("Missing required command: %s" % name)
     env = load_env()
@@ -245,29 +252,51 @@ def drop_agent_db(state, values, tools):
         raise LaunchError("Owned database still exists after cleanup; state retained")
 
 
-def create_agent_db(state, values, source, tools, schema_mode="migrate"):
+def create_agent_db(state, values, source, tools, schema_mode="migrate", clone_mode="auto"):
     if schema_mode not in ("current", "migrate"):
         raise LaunchError("Unknown schema mode")
+    if clone_mode not in ("auto", "template", "dump"):
+        raise LaunchError("Unknown clone mode")
     host, port, source_name = source
     name = state["dbName"]
     db_env = {**os.environ, "PGPASSWORD": values["DB_PASS"]}
     if database_exists(tools, db_env, host, port, values["DB_USER"], name):
         raise LaunchError("Refusing to reuse an existing database without a ready agent state")
-    run([tools["createdb"], "-h", host, "-p", str(port), "-U", values["DB_USER"], name],
-        env=db_env, log=STATE_DIR / "database.log", timeout=60)
-    state["dbEndpoint"] = {"host": host, "port": port, "user": values["DB_USER"], "sourceName": source_name}
-    state["dbCreated"] = True
-    write_state(state)
-    archive = STATE_DIR / "seed.dump"
-    try:
-        run([tools["pg_dump"], "-Fc", "--no-owner", "--no-privileges", "-h", host,
-             "-p", str(port), "-U", values["DB_USER"], "-d", source_name, "-f", str(archive)],
-            env=db_env, log=STATE_DIR / "database.log", timeout=600)
-        run([tools["pg_restore"], "--exit-on-error", "--no-owner", "--no-privileges", "-h", host,
-             "-p", str(port), "-U", values["DB_USER"], "-d", name, str(archive)],
-            env=db_env, log=STATE_DIR / "database.log", timeout=600)
-    finally:
-        archive.unlink(missing_ok=True)
+    cloned_by_template = False
+    if clone_mode in ("auto", "template"):
+        try:
+            run([tools["createdb"], "-T", source_name, "-h", host, "-p", str(port),
+                 "-U", values["DB_USER"], name],
+                env=db_env, log=STATE_DIR / "database.log", timeout=120)
+            state["dbEndpoint"] = {"host": host, "port": port, "user": values["DB_USER"], "sourceName": source_name}
+            state["dbCreated"] = True
+            state["cloneStrategy"] = "template"
+            write_state(state)
+            cloned_by_template = True
+        except LaunchError:
+            if clone_mode == "template":
+                raise
+            if database_exists(tools, db_env, host, port, values["DB_USER"], name):
+                raise LaunchError("Template clone failed leaving an incomplete database; inspect and retry")
+    if not cloned_by_template:
+        run([tools["createdb"], "-h", host, "-p", str(port), "-U", values["DB_USER"], name],
+            env=db_env, log=STATE_DIR / "database.log", timeout=60)
+        state["dbEndpoint"] = {"host": host, "port": port, "user": values["DB_USER"], "sourceName": source_name}
+        state["dbCreated"] = True
+        state["cloneStrategy"] = "dump"
+        write_state(state)
+        archive = STATE_DIR / "seed.dump.d"
+        shutil.rmtree(archive, ignore_errors=True)
+        jobs = str(PG_PARALLEL_JOBS)
+        try:
+            run([tools["pg_dump"], "-Fd", "-j", jobs, "--no-owner", "--no-privileges", "-h", host,
+                 "-p", str(port), "-U", values["DB_USER"], "-d", source_name, "-f", str(archive)],
+                env=db_env, log=STATE_DIR / "database.log", timeout=600)
+            run([tools["pg_restore"], "-j", jobs, "--exit-on-error", "--no-owner", "--no-privileges", "-h", host,
+                 "-p", str(port), "-U", values["DB_USER"], "-d", name, str(archive)],
+                env=db_env, log=STATE_DIR / "database.log", timeout=600)
+        finally:
+            shutil.rmtree(archive, ignore_errors=True)
     state["cloneRestored"] = True
     state["schemaMode"] = schema_mode
     state["tenantSchemasProcessed"] = 0
@@ -360,6 +389,18 @@ MODULE_IMPORT = re.compile(
 )
 
 
+def _fetch_module(module_url):
+    with urlopen(module_url, timeout=3) as response:
+        if response.status != 200 or "javascript" not in response.headers.get("Content-Type", ""):
+            return None
+        source = response.read().decode("utf-8")
+    return [
+        urljoin(module_url, match.group(1))
+        for match in MODULE_IMPORT.finditer(source)
+        if match.group(1).startswith(("/", "."))
+    ]
+
+
 def frontend_ready(url):
     """Fetch the module graph a browser needs, including optimized dependencies."""
     try:
@@ -374,21 +415,23 @@ def frontend_ready(url):
         origin = urlparse(url).netloc
         pending = [urljoin(url, source) for source in parser.sources]
         seen = set()
-        while pending:
-            module_url = pending.pop()
-            if module_url in seen:
-                continue
-            if len(seen) >= 5000 or urlparse(module_url).netloc != origin:
-                return False
-            seen.add(module_url)
-            with urlopen(module_url, timeout=3) as response:
-                if response.status != 200 or "javascript" not in response.headers.get("Content-Type", ""):
-                    return False
-                source = response.read().decode("utf-8")
-            for match in MODULE_IMPORT.finditer(source):
-                specifier = match.group(1)
-                if specifier.startswith(("/", ".")):
-                    pending.append(urljoin(module_url, specifier))
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            while pending:
+                wave = []
+                while pending and len(wave) < 32:
+                    module_url = pending.pop()
+                    if module_url in seen:
+                        continue
+                    if len(seen) >= 5000 or urlparse(module_url).netloc != origin:
+                        return False
+                    seen.add(module_url)
+                    wave.append(module_url)
+                if not wave:
+                    continue
+                for imports in pool.map(_fetch_module, wave):
+                    if imports is None:
+                        return False
+                    pending.extend(imports)
         return True
     except (HTTPError, URLError, TimeoutError, OSError, UnicodeError):
         return False
@@ -536,66 +579,120 @@ def lock_state():
     return handle
 
 
+def backend_cache_key(java_version):
+    """Content-address clean backend trees so frontend-only PRs and retries reuse cached WARs."""
+    try:
+        dirty = run(["git", "status", "--porcelain", "--", ".", ":(exclude)frontend", ":(exclude)docs", ":(exclude).env"])
+        if dirty:
+            return None
+        tree = run(["git", "ls-tree", "-r", "HEAD", "--", ".", ":(exclude)frontend", ":(exclude)docs"])
+        if not tree:
+            return None
+    except (LaunchError, OSError, subprocess.TimeoutExpired):
+        return None
+    return hashlib.sha256((java_version + "\n" + tree).encode("utf-8")).hexdigest()[:32]
+
+
+def prune_war_cache(directory, limit=WAR_CACHE_LIMIT):
+    try:
+        entries = sorted((p for p in directory.glob("*.war") if p.is_file()),
+                         key=lambda p: p.stat().st_mtime, reverse=True)
+        for stale in entries[limit:]:
+            stale.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def build_backend(java):
     pom = (ROOT / "pom.xml").read_text(encoding="utf-8")
     final_name = re.search(r"<finalName>\s*([A-Za-z0-9_.-]+)\s*</finalName>", pom)
     if not final_name:
         raise LaunchError("pom.xml has no simple build finalName")
-    run(["mvn", "-q", "-Dmaven.test.skip=true", "package"], env=java,
-        log=STATE_DIR / "backend.log", timeout=600)
+    java_target = re.search(r"<java.version>\s*(\d+)\s*</java.version>", pom)
+    java_version = java_target.group(1) if java_target else "unknown"
     artifact = ROOT / "target" / (final_name.group(1) + ".war")
+    cache_key = backend_cache_key(java_version)
+    cached = WAR_CACHE_DIR / (cache_key + ".war") if cache_key else None
+    if cached and cached.is_file():
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(cached, artifact)
+        try:
+            cached.touch()
+        except OSError:
+            pass
+        return artifact
+    run(["mvn", "-q", "-T", "2", "-Dmaven.test.skip=true", "package"], env=java,
+        log=STATE_DIR / "backend.log", timeout=600)
     if not artifact.is_file():
         raise LaunchError("Backend build did not produce %s" % artifact)
+    if cached:
+        try:
+            WAR_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            staged = WAR_CACHE_DIR / (".war-" + uuid4().hex + ".tmp")
+            shutil.copy2(artifact, staged)
+            staged.replace(cached)
+            prune_war_cache(WAR_CACHE_DIR)
+        except OSError:
+            pass
     return artifact
 
 
-def start(timeout, max_runtime_minutes, schema_mode="migrate"):
+def start(timeout, max_runtime_minutes, schema_mode="migrate", clone_mode="auto", skip_frontend=False):
     if schema_mode not in ("current", "migrate"):
         raise LaunchError("Unknown schema mode")
+    if clone_mode not in ("auto", "template", "dump"):
+        raise LaunchError("Unknown clone mode")
     with lock_state():
         existing = read_state()
         if existing:
             if existing.get("schemaMode") != schema_mode:
                 raise LaunchError("Schema mode changed; stop this run before starting with the requested mode")
+            if bool(existing.get("frontendSkipped", False)) != bool(skip_frontend):
+                raise LaunchError("Frontend mode changed; stop this run before starting with the requested mode")
             if existing.get("commit") != run(["git", "rev-parse", "HEAD"]):
                 raise LaunchError("Worktree HEAD changed; stop this run before starting the new revision")
+            fe_ok = skip_frontend or (
+                alive(existing.get("frontendPid"), existing.get("frontendStamp"))
+                and frontend_ready(existing["frontendUrl"])
+            )
             if alive(existing.get("backendPid"), existing.get("backendStamp")) and \
-                    alive(existing.get("frontendPid"), existing.get("frontendStamp")) and \
-                    backend_login_ready(existing["backendUrl"]) and frontend_ready(existing["frontendUrl"]):
+                    backend_login_ready(existing["backendUrl"]) and fe_ok:
                 existing["expiresAt"] = time.time() + max_runtime_minutes * 60
                 write_state(existing)
                 output(ok=True, status="already_ready", expiresAt=existing["expiresAt"],
-                       backendTransportReady=True, frontendReady=True,
+                       backendTransportReady=True, frontendReady=not skip_frontend,
+                       frontendSkipped=skip_frontend,
                        **readiness_metadata(existing),
                        **{k: existing[k] for k in ("frontendUrl", "backendUrl", "commit", "dbName")})
                 return
             raise LaunchError("Previous agent run is incomplete; inspect status and run stop before retrying")
         commit = run(["git", "rev-parse", "HEAD"])
-        values, source, tools, java, size = preflight()
-        modules = prepare_frontend()
+        values, source, tools, java, size = preflight(skip_frontend=skip_frontend)
+        modules = "skipped" if skip_frontend else prepare_frontend()
         artifact = build_backend(java)
         if run(["git", "rev-parse", "HEAD"]) != commit:
             raise LaunchError("Worktree HEAD changed during preparation; start the exact revision again")
         offset = int(KEY[:8], 16) % 40
         backend_port = choose_port(8100 + offset, os.environ.get("JMV_BACKEND_PORT"))
-        frontend_port = choose_port(5200 + offset, os.environ.get("JMV_FRONTEND_PORT"))
+        frontend_port = None if skip_frontend else choose_port(5200 + offset, os.environ.get("JMV_FRONTEND_PORT"))
         backend_url = "http://127.0.0.1:%s" % backend_port
-        frontend_url = "http://127.0.0.1:%s" % frontend_port
+        frontend_url = None if skip_frontend else "http://127.0.0.1:%s" % frontend_port
         state = {"owner": "joulemv-agent-run", "repo": str(ROOT), "commit": commit,
                  "dbName": "jmv_ai_" + KEY, "backendUrl": backend_url,
-                 "frontendUrl": frontend_url, "backendPid": None, "frontendPid": None,
+                 "frontendUrl": frontend_url, "frontendSkipped": skip_frontend,
+                 "backendPid": None, "frontendPid": None,
                  "dbCreated": False, "phase": "cloning", "createdAt": time.time(),
                  "runId": uuid4().hex, "schemaMode": schema_mode,
                  "cloneRestored": False, "tenantSchemasProcessed": 0, "migrationsVerified": False}
         write_state(state)
         try:
-            vite_config = prepare_vite(state["runId"])
-            create_agent_db(state, values, source, tools, schema_mode)
+            vite_config = None if skip_frontend else prepare_vite(state["runId"])
+            create_agent_db(state, values, source, tools, schema_mode, clone_mode=clone_mode)
             app_env = {**java, **values,
                        "DB_URL": jdbc_url(source[0], source[1], state["dbName"]),
                        "DB_AUTH_URL": jdbc_url(source[0], source[1], state["dbName"]),
                        "SERVER_PORT": str(backend_port),
-                       "FRONTEND_URL": frontend_url,
+                       "FRONTEND_URL": frontend_url or values.get("FRONTEND_URL", "http://127.0.0.1"),
                        "ALLOWED_ORIGINS": ",".join(filter(None, [values.get("ALLOWED_ORIGINS"), frontend_url])),
                        "APP_LOCAL_DIR": str(STATE_DIR / "files"),
                        "SENTRY_DSN": "", "SENTRY_LOGS_ENABLED": "false",
@@ -604,7 +701,6 @@ def start(timeout, max_runtime_minutes, schema_mode="migrate"):
                        "SECURE_AUTH_COOKIES": "false",
                        "FORMULA_THRESHOLD_NOTIFICATION_POLL_DELAY_MS": "86400000"}
             (STATE_DIR / "files").mkdir(exist_ok=True)
-            frontend_env = {**os.environ, **values, **frontend_api_env(backend_url), "VITE_SENTRY_DSN": ""}
             with open(STATE_DIR / "backend.log", "a", encoding="utf-8") as be_log:
                 backend = subprocess.Popen([str(Path(java["JAVA_HOME"]) / "bin/java"), "-jar", str(artifact)],
                                            cwd=ROOT, env=app_env, stdout=be_log, stderr=subprocess.STDOUT,
@@ -616,26 +712,30 @@ def start(timeout, max_runtime_minutes, schema_mode="migrate"):
             write_state(state)
             if not state["backendStamp"]:
                 raise LaunchError("Cannot verify backend process identity; runtime was not marked ready")
-            with open(STATE_DIR / "frontend.log", "a", encoding="utf-8") as fe_log:
-                frontend = subprocess.Popen(["npm", "--prefix", "frontend", "run", "dev", "--",
-                                             "--config", str(vite_config), "--host", "127.0.0.1",
-                                             "--port", str(frontend_port), "--strictPort"],
-                                            cwd=ROOT, env=frontend_env, stdout=fe_log,
-                                            stderr=subprocess.STDOUT, start_new_session=True)
-            state["frontendPid"] = frontend.pid
-            write_state(state)
-            state["frontendStamp"] = process_stamp(frontend.pid)
-            write_state(state)
-            if not state["frontendStamp"]:
-                raise LaunchError("Cannot verify frontend process identity; runtime was not marked ready")
+            frontend = None
+            if not skip_frontend:
+                frontend_env = {**os.environ, **values, **frontend_api_env(backend_url), "VITE_SENTRY_DSN": ""}
+                with open(STATE_DIR / "frontend.log", "a", encoding="utf-8") as fe_log:
+                    frontend = subprocess.Popen(["npm", "--prefix", "frontend", "run", "dev", "--",
+                                                 "--config", str(vite_config), "--host", "127.0.0.1",
+                                                 "--port", str(frontend_port), "--strictPort"],
+                                                cwd=ROOT, env=frontend_env, stdout=fe_log,
+                                                stderr=subprocess.STDOUT, start_new_session=True)
+                state["frontendPid"] = frontend.pid
+                write_state(state)
+                state["frontendStamp"] = process_stamp(frontend.pid)
+                write_state(state)
+                if not state["frontendStamp"]:
+                    raise LaunchError("Cannot verify frontend process identity; runtime was not marked ready")
             deadline = time.monotonic() + timeout
             while time.monotonic() < deadline:
-                if backend.poll() is not None or frontend.poll() is not None:
+                if backend.poll() is not None or (frontend is not None and frontend.poll() is not None):
                     raise LaunchError("A server exited during startup; see backend.log and frontend.log")
-                if backend_login_ready(backend_url) and frontend_ready(frontend_url):
+                if backend_login_ready(backend_url) and (skip_frontend or frontend_ready(frontend_url)):
                     if run(["git", "rev-parse", "HEAD"]) != commit:
                         raise LaunchError("Worktree HEAD changed during startup; runtime was not marked ready")
-                    for role, process in (("backend", backend), ("frontend", frontend)):
+                    processes = (("backend", backend),) if skip_frontend else (("backend", backend), ("frontend", frontend))
+                    for role, process in processes:
                         members = process_group(process.pid)
                         if members.get(str(process.pid)) != " ".join(state[role + "Stamp"].split()):
                             raise LaunchError("Server identity changed during startup; state retained")
@@ -648,8 +748,10 @@ def start(timeout, max_runtime_minutes, schema_mode="migrate"):
                                          cwd=ROOT, stdout=watch_log, stderr=subprocess.STDOUT,
                                          start_new_session=True)
                     output(ok=True, status="ready", frontendUrl=frontend_url,
-                           backendTransportReady=True, frontendReady=True,
+                           backendTransportReady=True, frontendReady=not skip_frontend,
+                           frontendSkipped=skip_frontend,
                            backendUrl=backend_url, commit=commit, dbIsolation="clone",
+                           cloneStrategy=state.get("cloneStrategy"),
                            dbName=state["dbName"], sourceSizeMiB=size,
                            **readiness_metadata(state), frontendDependencies=modules,
                            expiresAt=state["expiresAt"],
@@ -668,10 +770,11 @@ def start(timeout, max_runtime_minutes, schema_mode="migrate"):
                 drop_agent_db(state, values, tools)
             except Exception as cleanup_error:
                 cleanup_errors.append("database: %s" % cleanup_error)
-            try:
-                cleanup_vite(state["runId"])
-            except OSError as cleanup_error:
-                cleanup_errors.append("Vite cache: %s" % cleanup_error)
+            if not skip_frontend:
+                try:
+                    cleanup_vite(state["runId"])
+                except OSError as cleanup_error:
+                    cleanup_errors.append("Vite cache: %s" % cleanup_error)
             if cleanup_errors:
                 raise LaunchError("Startup failed: %s; cleanup failed: %s; state retained for retry" %
                                   (startup_error, "; ".join(cleanup_errors))) from startup_error
@@ -684,7 +787,7 @@ def readiness_metadata(state):
             "tenantSchemasProcessed": state.get("tenantSchemasProcessed", 0),
             "migrationsVerified": state.get("migrationsVerified", False),
             "authenticationVerified": False,
-            "readinessScope": "transport_and_frontend_modules"}
+            "readinessScope": "backend_transport_only" if state.get("frontendSkipped") else "transport_and_frontend_modules"}
 
 
 def status():
@@ -692,12 +795,16 @@ def status():
     if not state:
         output(ok=False, status="stopped", worktree=str(ROOT))
         return 1
+    skip_frontend = bool(state.get("frontendSkipped"))
     backend = alive(state.get("backendPid"), state.get("backendStamp")) and backend_login_ready(state["backendUrl"])
-    frontend = alive(state.get("frontendPid"), state.get("frontendStamp")) and frontend_ready(state["frontendUrl"])
+    frontend = False if skip_frontend else (
+        alive(state.get("frontendPid"), state.get("frontendStamp")) and frontend_ready(state["frontendUrl"])
+    )
     commit_matches = state["commit"] == run(["git", "rev-parse", "HEAD"])
-    ready = backend and frontend and commit_matches
+    ready = backend and (skip_frontend or frontend) and commit_matches
     output(ok=ready, status="ready" if ready else "unhealthy",
            backendReady=backend, backendTransportReady=backend, frontendReady=frontend,
+           frontendSkipped=skip_frontend,
            commitMatches=commit_matches, **readiness_metadata(state),
            frontendUrl=state["frontendUrl"], backendUrl=state["backendUrl"],
            commit=state["commit"], expiresAt=state.get("expiresAt"), logs=str(STATE_DIR))
@@ -717,7 +824,8 @@ def stop(expected_run_id=None):
         values = load_env()
         tools = pg_tools()
         drop_agent_db(state, values, tools)
-        cleanup_vite(state["runId"])
+        if not state.get("frontendSkipped"):
+            cleanup_vite(state["runId"])
         STATE_FILE.unlink(missing_ok=True)
         output(ok=True, status="stopped", databaseDropped=True, serversStopped=True)
 
@@ -728,8 +836,8 @@ def watchdog(run_id):
         if not state or state.get("runId") != run_id:
             return
         expired = time.time() >= state["expiresAt"]
-        server_exited = not alive(state.get("backendPid"), state.get("backendStamp")) or \
-            not alive(state.get("frontendPid"), state.get("frontendStamp"))
+        frontend_exited = not state.get("frontendSkipped") and not alive(state.get("frontendPid"), state.get("frontendStamp"))
+        server_exited = not alive(state.get("backendPid"), state.get("backendStamp")) or frontend_exited
         if expired or server_exited:
             try:
                 stop(expected_run_id=run_id)
@@ -742,10 +850,16 @@ def watchdog(run_id):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("doctor")
+    doctor_parser = sub.add_parser("doctor")
+    doctor_parser.add_argument("--skip-frontend", action="store_true",
+                               help="Check backend and database prerequisites only")
     start_parser = sub.add_parser("start")
     start_parser.add_argument("--schema-mode", choices=("current", "migrate"), default="migrate",
                               help="migrate replays branch tenant SQL; current preserves the restored source schema")
+    start_parser.add_argument("--clone-mode", choices=("auto", "template", "dump"), default="auto",
+                              help="auto tries fast PostgreSQL template clone then falls back to parallel dump/restore")
+    start_parser.add_argument("--skip-frontend", action="store_true",
+                              help="Start backend and isolated database only (for backend-only technical acceptance)")
     start_parser.add_argument("--timeout", type=int, default=600)
     start_parser.add_argument("--max-runtime-minutes", type=float, default=120)
     sub.add_parser("status")
@@ -765,12 +879,13 @@ def main():
             return 2
     try:
         if args.command == "doctor":
-            _, _, _, _, size = preflight()
+            _, _, _, _, size = preflight(skip_frontend=args.skip_frontend)
             output(ok=True, status="ready_to_start", worktree=str(ROOT), sourceSizeMiB=size)
         elif args.command == "start":
             if args.timeout <= 0 or not 0.1 <= args.max_runtime_minutes <= 1440:
                 raise LaunchError("--timeout must be positive and --max-runtime-minutes must be between 0.1 and 1440")
-            start(args.timeout, args.max_runtime_minutes, args.schema_mode)
+            start(args.timeout, args.max_runtime_minutes, args.schema_mode,
+                  clone_mode=args.clone_mode, skip_frontend=args.skip_frontend)
         elif args.command == "status":
             return status()
         elif args.command == "_watchdog":

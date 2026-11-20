@@ -187,7 +187,9 @@ def next_actions(pr):
         add("publication", "Complete publication/readback within authorized scope")
     if pr["live"]["display_status"] == "blocked":
         add("blocked", "Resolve test blocker")
-    elif pr["live"]["display_status"] in ("pending", "incomplete") or any(s["display_status"] not in ("pass", "fail") for s in pr["scenarios"]):
+    elif pr["live"]["display_status"] != "not_required" and (
+            pr["live"]["display_status"] in ("pending", "incomplete")
+            or any(s["display_status"] not in ("pass", "fail") for s in pr["scenarios"])):
         add("testing", "Complete planned checks and evidence")
     if pr.get("pending_cleanup") or pr["live"].get("cleanup_status") == "pending":
         add("cleanup", "Verify owned resource cleanup")

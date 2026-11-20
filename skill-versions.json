@@ -2,7 +2,7 @@
   "schema_version": 1,
   "skills": {
     "review-all": {
-      "version": "1.1.0",
+      "version": "1.2.0",
       "path": "git-and-review-workflow/review-all"
     },
     "code-review": {
@@ -26,7 +26,7 @@
       "path": "testing-and-quality/browser-testing"
     },
     "review-queue": {
-      "version": "1.1.0",
+      "version": "1.2.0",
       "path": "git-and-review-workflow/review-queue"
     },
     "respond": {
@@ -38,11 +38,11 @@
       "path": "git-and-review-workflow/respond-all"
     },
     "respond-queue": {
-      "version": "1.1.0",
+      "version": "1.2.0",
       "path": "git-and-review-workflow/respond-queue"
     },
     "update-from-work": {
-      "version": "1.1.0",
+      "version": "1.2.0",
       "path": "git-and-review-workflow/update-from-work"
     }
   }

@@ -32,6 +32,15 @@ SETTLED_CI = ('passed', 'failed', 'missing')
 SKIP_LIMIT = 200
 SEMVER = re.compile(r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)')
 SHA = re.compile(r'[0-9a-f]{40}')
+# Pure policy sign-off holds explicitly approve from the reviewer's side and set
+# Request changes solely because the PR touches a sign-off-gated file. Any extra
+# comments, questions, or fix wording falls through to full analysis (fail-closed).
+SIGN_OFF_HOLD = re.compile(
+    r"\AApproved from my side\.\s+"
+    r"I(?:'|\u2019)?m setting this to Request changes because it touches\s+[^?\n]+\.?\Z",
+    re.IGNORECASE,
+)
+HOLD_REASON = 'Pure sign-off hold (no code change requested); awaiting human sign-off.'
 BATCH_DEFAULTS = dict(number=None, feedback_batch=None, head=None, fix_rounds=0, status='unknown',
                       actions=[], commits=[], replies=[], re_request={}, ci={'state': 'unknown'},
                       handoff_reason=None)
@@ -248,8 +257,40 @@ def save(path, data):
     write_atomic(path, json.dumps(data, indent=2) + '\n')
 
 
-def add_skips(state, rows):
-    state['skips'] = (state['skips'] + list(rows))[-SKIP_LIMIT:]
+def is_signoff_hold(untouched, requests):
+    """True only when every untouched item is a pure sign-off hold review with no edits requested."""
+    if not untouched or any(item.get('kind') != 'CHANGES_REQUESTED' for item in untouched):
+        return False
+    by_url = {r.get('html_url'): r for r in requests}
+    for item in untouched:
+        review = by_url.get(item.get('url'))
+        if not review:
+            return False
+        body = ' '.join((review.get('body') or '').split())
+        if not body or '?' in body or not SIGN_OFF_HOLD.fullmatch(body):
+            return False
+    return True
+
+
+def add_skips(state, rows, *, dedupe=False):
+    existing = list(state['skips'])
+    if not dedupe:
+        state['skips'] = (existing + list(rows))[-SKIP_LIMIT:]
+        return
+    for row in rows:
+        key = (row.get('url'), row.get('command'), row.get('reason'), row.get('head'))
+        matched = next(
+            (i for i in range(len(existing) - 1, -1, -1)
+             if isinstance(existing[i], dict)
+             and (existing[i].get('url'), existing[i].get('command'),
+                  existing[i].get('reason'), existing[i].get('head')) == key),
+            None,
+        )
+        if matched is not None:
+            existing[matched] = {**existing[matched], 'at': row.get('at', existing[matched].get('at'))}
+        else:
+            existing.append(row)
+    state['skips'] = existing[-SKIP_LIMIT:]
 
 
 def active_jobs(state):
@@ -491,23 +532,45 @@ def main(argv=None):
                 raise ValueError('incomplete discovery')
             with history.locked() as directory:
                 filtered, dropped = history.filter_discovery(discovery, history.read_state(directory))
-            selected, skipped = [], list(dropped)
+            selected, skipped, holds = [], list(dropped), []
             for match in filtered['matches']:
                 try:
-                    pr, _ = snapshot(match['number'], match['untouched'])
-                    selected.append({**match, 'feedback_batch': batch_id(match['untouched']),
-                                     'headSha': pr['head']['sha']})
+                    pr, requests = snapshot(match['number'], match['untouched'])
+                    entry = {**match, 'feedback_batch': batch_id(match['untouched']),
+                             'headSha': pr['head']['sha']}
+                    if is_signoff_hold(match['untouched'], requests):
+                        holds.append(entry)
+                    else:
+                        selected.append(entry)
                 except ValueError as exc:
                     skipped.append({'url': match['url'], 'reason': str(exc)})
             with locked(args.state) as state:
+                for row in holds:
+                    key = f"{row['number']}:{row['feedback_batch']}"
+                    if key not in state['batches']:
+                        state['batches'][key] = dict(
+                            copy.deepcopy(BATCH_DEFAULTS), number=row['number'],
+                            feedback_batch=row['feedback_batch'], head=row['headSha'],
+                            status='handoff', handoff_reason=HOLD_REASON, updated_at=stamp(),
+                        )
+                        skipped.append({'url': row['url'], 'reason': HOLD_REASON, 'head': row['headSha']})
+                    else:
+                        existing = state['batches'][key]
+                        skipped.append({'url': row['url'],
+                                        'reason': f"unchanged feedback batch; already {existing.get('status', 'recorded')}",
+                                        'head': row['headSha']})
                 remaining = []
                 for row in selected:
-                    if f"{row['number']}:{row['feedback_batch']}" in state['batches']:
-                        skipped.append({'url': row['url'], 'reason': 'unchanged feedback batch; resume saved run',
-                                        'head': row['headSha']})
+                    key = f"{row['number']}:{row['feedback_batch']}"
+                    if key in state['batches']:
+                        existing = state['batches'][key]
+                        reason = (f"unchanged feedback batch; already {existing.get('status')}"
+                                  if existing.get('status') in TERMINAL
+                                  else 'unchanged feedback batch; resume saved run')
+                        skipped.append({'url': row['url'], 'reason': reason, 'head': row['headSha']})
                     else:
                         remaining.append(row)
-                add_skips(state, ({**s, 'at': stamp(), 'command': 'plan'} for s in skipped))
+                add_skips(state, ({**s, 'at': stamp(), 'command': 'plan'} for s in skipped), dedupe=True)
             save(args.output, {**filtered, 'matches': remaining, 'skips': skipped})
             print(json.dumps({'selection': str(args.output), 'count': len(remaining)})); return 0
         if args.command == 'claim':

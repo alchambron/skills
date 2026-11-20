@@ -36,6 +36,7 @@ class QueueDigestTests(unittest.TestCase):
             'prior_day': recorded(1, '2026-11-19T04:59:59+00:00'),
             'older': recorded(2, '2026-11-19T01:00:00-05:00'),
             'success': recorded(3, '2026-11-19T06:45:00+00:00', live='complete', publication='not_required'),
+            'issues': recorded(6, '2026-11-19T06:50:00+00:00', verdict='issues', live='not_required', publication='verified'),
             'newer': recorded(2, '2026-11-19T06:15:00+00:00', 'blocked', reason='Prerequisite unavailable'),
             'failure': recorded(4, '2026-11-19T06:20:00+00:00', 'failed', path=None),
             'legacy': {'status': 'finished'},
@@ -48,15 +49,19 @@ class QueueDigestTests(unittest.TestCase):
             self.assertEqual(data['date'], '2026-11-19')
             self.assertEqual(data['repository'], 'EnerZam/JouleMV')
             reviews = data['reviews']
-            self.assertEqual([row['token'] for row in reviews], ['success', 'failure', 'newer', 'older'])
-            self.assertEqual(reviews[0]['head_sha'], 'a' * 40)
-            self.assertEqual(reviews[0]['base_sha'], 'b' * 40)
-            self.assertEqual(reviews[0]['live'], 'complete')
-            self.assertEqual(reviews[0]['publication'], 'not_required')
-            self.assertEqual(reviews[0]['html_path'], '/run/report/scenario-guide.html')
-            self.assertEqual(reviews[2]['outcome'], 'blocked')
-            self.assertEqual(reviews[2]['reason'], 'Prerequisite unavailable')
+            self.assertEqual([row['token'] for row in reviews], ['issues', 'success', 'failure', 'newer', 'older'])
+            self.assertEqual(reviews[0]['outcome'], 'completed')
+            self.assertEqual(reviews[0]['verdict'], 'issues')
+            self.assertEqual(reviews[0]['ping'], '#6 changes requested, see report')
+            self.assertEqual(reviews[1]['head_sha'], 'a' * 40)
+            self.assertEqual(reviews[1]['base_sha'], 'b' * 40)
+            self.assertEqual(reviews[1]['live'], 'complete')
+            self.assertEqual(reviews[1]['publication'], 'not_required')
+            self.assertEqual(reviews[1]['html_path'], '/run/report/scenario-guide.html')
+            self.assertEqual(reviews[3]['outcome'], 'blocked')
+            self.assertEqual(reviews[3]['reason'], 'Prerequisite unavailable')
             markdown = target.with_suffix('.md').read_text()
+            self.assertIn('#6 changes requested, see report', markdown)
             self.assertIn('#3 review ready, check before approving', markdown)
             self.assertIn('#2 review blocked, see report', markdown)
             self.assertNotIn('#2 review ready', markdown)
