@@ -1,1 +1,7 @@
-{"schema_version": 1, "requires": {"review-all": {"minimum": "1.1.0", "maximum_exclusive": "2.0.0"}}}
+{
+  "schema_version": 1,
+  "requires": {
+    "review-all": {"minimum": "1.1.0", "maximum_exclusive": "2.0.0"},
+    "respond-queue": {"minimum": "1.1.0", "maximum_exclusive": "2.0.0"}
+  }
+}
