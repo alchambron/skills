@@ -600,6 +600,17 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(len(saved["prs"][0]["scenarios"][0]["screenshots"]), 1)
         self.assertTrue((Path(second["results"]).parent / saved["prs"][0]["scenarios"][0]["screenshots"][0]).is_file())
 
+    def test_static_issues_with_live_not_required_has_no_testing_action(self):
+        data = ledger()
+        pr = data["prs"][0]
+        pr["review"] = {"status": "issues", "findings": [{"severity": "P2", "title": "Bug", "body": "Trigger", "origin": "static", "path": "a.ts", "line": 4, "side": "RIGHT"}], "standards": [], "spec": [], "limits": []}
+        pr["publication"] = {"status": "verified", "review_url": "https://github.com/Example/Application/pull/7#pullrequestreview-10"}
+        pr["live"] = {"status": "not_required", "reason": "Static review published verified REQUEST_CHANGES; live acceptance waits for the author's fix"}
+        pr["scenarios"] = []
+        saved = self.prepare(data)["prs"][0]
+        self.assertEqual(saved["live"]["display_status"], "not_required")
+        self.assertEqual([action["kind"] for action in saved["next_actions"]], ["fixes"])
+
 
 if __name__ == "__main__":
     unittest.main()

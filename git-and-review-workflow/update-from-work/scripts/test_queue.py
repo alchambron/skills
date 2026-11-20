@@ -1,5 +1,5 @@
 import unittest
-from queue import build_queue, select_top
+from queue import build_queue, select_candidates, select_top
 
 
 def pr(n, day, base='work', decision='APPROVED', kind='User'):
@@ -37,3 +37,14 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(build_queue([pr(1, 1, 'missing')]), [])
         with self.assertRaises(ValueError):
             build_queue([pr(1, 1, 'p2'), pr(2, 2, 'p1')])
+
+    def test_select_candidates_backfills_up_to_limit_and_includes_explicit_requests(self):
+        queue = build_queue([pr(i, i) for i in range(1, 6)])
+        # PRs 1 and 2 are up to date; PRs 3 and 4 need updates; PR 5 has an explicit reviewer request.
+        selected = select_candidates(queue, needs_update=[3, 4], explicit_requests=[5], limit=2)
+        self.assertEqual([e['prs'] for e in selected], [[3], [4], [5]])
+        # Deduplicates when an entry both needs an update and has an explicit request.
+        selected_dedup = select_candidates(queue, needs_update=[2, 4, 5], explicit_requests=[2, 5], limit=2)
+        self.assertEqual([e['prs'] for e in selected_dedup], [[2], [4], [5]])
+        with self.assertRaises(ValueError):
+            select_candidates(queue, needs_update=[1], limit=4)

@@ -246,17 +246,37 @@ class RuntimeTests(unittest.TestCase):
         with patch.object(agent_run, "database_exists", return_value=False), \
                 patch.object(agent_run, "run", return_value="") as run:
             count = agent_run.create_agent_db(self.state, self.values, self.source, self.tools, "current")
-        self.assertEqual([call.args[0][0] for call in run.call_args_list],
-                         ["createdb", "pg_dump", "pg_restore"])
+        self.assertEqual([call.args[0][0] for call in run.call_args_list], ["createdb"])
+        self.assertIn("-T", run.call_args_list[0].args[0])
         self.assertEqual(count, 0)
         persisted = agent_run.read_state()
         self.assertEqual(persisted["dbEndpoint"], {"host": "127.0.0.1", "port": 5432, "user": "localuser", "sourceName": "devdb"})
         self.assertNotIn("DB_PASS", str(persisted))
         self.assertNotIn(self.values["DB_PASS"], str(persisted))
         self.assertTrue(persisted["cloneRestored"])
+        self.assertEqual(persisted["cloneStrategy"], "template")
         self.assertEqual(persisted["schemaMode"], "current")
         self.assertEqual(persisted["tenantSchemasProcessed"], 0)
         self.assertFalse(persisted["migrationsVerified"])
+
+    def test_auto_clone_falls_back_to_parallel_dump_and_restore_when_template_fails(self):
+        def run(args, **_kwargs):
+            if args[0] == "createdb" and "-T" in args:
+                raise agent_run.LaunchError("source database is being accessed by other users")
+            return ""
+
+        with patch.object(agent_run, "database_exists", return_value=False), \
+                patch.object(agent_run, "run", side_effect=run) as mocked:
+            count = agent_run.create_agent_db(self.state, self.values, self.source, self.tools, "current", clone_mode="auto")
+        self.assertEqual(count, 0)
+        self.assertEqual([call.args[0][0] for call in mocked.call_args_list],
+                         ["createdb", "createdb", "pg_dump", "pg_restore"])
+        self.assertIn("-Fd", mocked.call_args_list[2].args[0])
+        self.assertIn("-j", mocked.call_args_list[2].args[0])
+        self.assertIn("-j", mocked.call_args_list[3].args[0])
+        persisted = agent_run.read_state()
+        self.assertEqual(persisted["cloneStrategy"], "dump")
+        self.assertTrue(persisted["cloneRestored"])
 
     def test_migrate_schema_replays_sql_only_against_cloned_tenants(self):
         sql_path = self.root / "src/main/sql/update-tenant.sql"
@@ -288,7 +308,7 @@ class RuntimeTests(unittest.TestCase):
         with patch.object(agent_run, "database_exists", return_value=False), \
                 patch.object(agent_run, "run", side_effect=run):
             with self.assertRaisesRegex(agent_run.LaunchError, "restore failed"):
-                agent_run.create_agent_db(self.state, self.values, self.source, self.tools, "current")
+                agent_run.create_agent_db(self.state, self.values, self.source, self.tools, "current", clone_mode="dump")
         self.assertFalse(agent_run.read_state().get("cloneRestored", False))
 
     def test_failed_migration_is_not_verified(self):
@@ -541,6 +561,52 @@ class RuntimeTests(unittest.TestCase):
         self.assertFalse(first_cache.exists())
         self.assertTrue(second_config.exists())
         self.assertTrue(second_cache.exists())
+
+    def test_build_backend_uses_content_addressed_war_cache_on_clean_tree(self):
+        (self.root / "pom.xml").write_text("<project><properties><java.version>21</java.version></properties>"
+                                           "<build><finalName>joulemv</finalName></build></project>")
+        war_cache = self.root / "war-cache"
+
+        def fake_mvn(args, **_kwargs):
+            target = self.root / "target" / "joulemv.war"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"war-bytes")
+            return ""
+
+        with patch.object(agent_run, "WAR_CACHE_DIR", war_cache), \
+                patch.object(agent_run, "backend_cache_key", return_value="abc123"), \
+                patch.object(agent_run, "run", side_effect=fake_mvn) as mocked:
+            first = agent_run.build_backend({"JAVA_HOME": "/jdk"})
+            self.assertEqual(first.read_bytes(), b"war-bytes")
+            self.assertEqual(mocked.call_count, 1)
+            self.assertIn("-T", mocked.call_args.args[0])
+            first.unlink()
+            second = agent_run.build_backend({"JAVA_HOME": "/jdk"})
+            self.assertEqual(second.read_bytes(), b"war-bytes")
+            self.assertEqual(mocked.call_count, 1)
+
+    def test_skip_frontend_mode_mismatch_and_status_without_vite(self):
+        with patch.object(agent_run, "lock_state", return_value=contextlib.nullcontext()), \
+                patch.object(agent_run, "read_state", return_value={"schemaMode": "current", "frontendSkipped": False}), \
+                patch.object(agent_run, "preflight") as preflight:
+            with self.assertRaisesRegex(agent_run.LaunchError, "Frontend mode changed"):
+                agent_run.start(10, 1, "current", skip_frontend=True)
+            preflight.assert_not_called()
+
+        state = {**self.state, "backendUrl": "http://127.0.0.1:8100", "frontendUrl": None,
+                 "frontendSkipped": True, "commit": "head", "schemaMode": "current"}
+        captured = io.StringIO()
+        with patch.object(agent_run, "read_state", return_value=state), \
+                patch.object(agent_run, "alive", return_value=True), \
+                patch.object(agent_run, "backend_login_ready", return_value=True), \
+                patch.object(agent_run, "frontend_ready", side_effect=AssertionError("should not probe vite")), \
+                patch.object(agent_run, "run", return_value="head"), contextlib.redirect_stdout(captured):
+            self.assertEqual(agent_run.status(), 0)
+        import json
+        result = json.loads(captured.getvalue())
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["frontendSkipped"])
+        self.assertEqual(result["readinessScope"], "backend_transport_only")
 
 
 if __name__ == "__main__":

@@ -489,6 +489,32 @@ class CliTests(Contexts):
         self.assertEqual(out['count'], 0)
         self.assertIn('no current', json.loads(output.read_text())['skips'][0]['reason'])
 
+    def test_signoff_hold_records_handoff_and_plan_dedupes_hourly_skips(self):
+        hold_body = "Approved from my side. I'm setting this to Request changes because it touches `src/main/sql/update-tenant.sql`."
+        self.github.reviews = [dict(review(), body=hold_body)]
+        match = {'url': URL, 'number': 1, 'untouched': [TRIGGER], 'feedback': TRIGGER}
+        code, out, output = self.plan({'complete': True, 'matches': [match]})
+        self.assertEqual((code, out['count']), (0, 0))
+        record = self.state_data()['batches'][f'1:{BATCH}']
+        self.assertEqual(record['status'], 'handoff')
+        self.assertEqual(record['fix_rounds'], 0)
+        self.assertIn('sign-off hold', record['handoff_reason'].lower())
+        # Repeated hourly sweeps distinguish terminal batches and do not spam state['skips'].
+        for _ in range(3):
+            code, out, output = self.plan({'complete': True, 'matches': [match]})
+            self.assertEqual((code, out['count']), (0, 0))
+            self.assertIn('already handoff', json.loads(output.read_text())['skips'][0]['reason'])
+        already_skips = [s for s in self.state_data()['skips'] if 'already handoff' in s.get('reason', '')]
+        self.assertEqual(len(already_skips), 1)
+
+    def test_signoff_hold_fails_closed_on_inline_comments_or_questions(self):
+        hold_body = "Approved from my side. I'm setting this to Request changes because it touches `src/main/sql/update-tenant.sql`."
+        self.assertTrue(q.is_signoff_hold([TRIGGER], [dict(review(), body=hold_body)]))
+        self.assertFalse(q.is_signoff_hold([TRIGGER, {'kind': 'inline', 'url': URL + '#discussion_r1', 'date': DATE, 'author': 'alice'}],
+                                           [dict(review(), body=hold_body)]))
+        self.assertFalse(q.is_signoff_hold([TRIGGER], [dict(review(), body=hold_body + ' Can you also rename this?')]))
+        self.assertFalse(q.is_signoff_hold([TRIGGER], [dict(review(), body='Please fix the bug.')]))
+
     def test_digest_mixed_schema_atomic_and_bounded(self):
         self.state.mkdir()
         legacy = {'schema_version': 1,
