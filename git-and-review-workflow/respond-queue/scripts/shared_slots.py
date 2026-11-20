@@ -8,6 +8,7 @@ import json
 PHASES = {
     'respond-queue': {'analysis': 'static', 'fix': 'live'},
     'review-queue': {'static': 'static', 'live': 'live', 'waiting_live': None},
+    'update-from-work': {'update': 'live'},
 }
 CAPACITY = {'static': 2, 'live': 1}
 
