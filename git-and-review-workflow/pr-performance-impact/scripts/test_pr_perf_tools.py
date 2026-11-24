@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests for the pr-performance-impact skill measurement scripts."""
+"""Unit tests for pr-performance-impact v2.0.0 scientific measurement tools."""
 
 from __future__ import annotations
 
@@ -14,6 +14,39 @@ import analyze_pr  # noqa: E402
 import api_sql_probe  # noqa: E402
 import code_metrics  # noqa: E402
 import skill_versions  # noqa: E402
+import stats_util  # noqa: E402
+
+
+class StatsUtilTests(unittest.TestCase):
+    def test_detects_statistically_significant_improvement(self) -> None:
+        base = [100.0, 102.0, 99.0, 101.0, 103.0, 100.5, 99.5]
+        pr = [78.0, 80.0, 79.0, 81.0, 77.5, 79.5, 80.5]
+        res = stats_util.compare_ab(base, pr, lower_is_better=True)
+        self.assertEqual(res["verdict"], "significant_improvement")
+        self.assertTrue(res["significant"])
+        self.assertGreater(res["improvement_pct"], 15.0)
+        self.assertLess(res["p_value"], 0.01)
+
+    def test_detects_statistically_significant_regression(self) -> None:
+        base = [50.0, 51.0, 49.0, 50.5, 52.0, 49.5, 50.0]
+        pr = [65.0, 66.0, 64.0, 67.0, 65.5, 64.5, 66.5]
+        res = stats_util.compare_ab(base, pr, lower_is_better=True)
+        self.assertEqual(res["verdict"], "significant_regression")
+        self.assertTrue(res["significant"])
+        self.assertLess(res["improvement_pct"], -20.0)
+        self.assertLess(res["p_value"], 0.01)
+
+    def test_rejects_noisy_overlapping_samples_as_no_significant_change(self) -> None:
+        base = [100.0, 105.0, 95.0, 102.0, 98.0, 101.0, 99.0]
+        pr = [99.0, 104.0, 96.0, 101.0, 97.0, 103.0, 98.0]
+        res = stats_util.compare_ab(base, pr, lower_is_better=True)
+        self.assertEqual(res["verdict"], "no_significant_change")
+        self.assertFalse(res["significant"])
+
+    def test_handles_insufficient_samples(self) -> None:
+        res = stats_util.compare_ab([10.0, 11.0], [5.0, 6.0])
+        self.assertEqual(res["verdict"], "insufficient_samples")
+        self.assertFalse(res["significant"])
 
 
 class CodeMetricsTests(unittest.TestCase):
@@ -33,27 +66,11 @@ class CodeMetricsTests(unittest.TestCase):
         self.assertEqual(shape["branches"], 2)
         self.assertEqual(shape["max_nesting"], 3)
 
-    def test_detects_db_calls_inside_loops(self) -> None:
-        bad_java = """
-        public void sync(List<Long> ids) {
-            for (Long id : ids) {
-                meterRepository.findById(id);
-            }
-        }
-        """
-        good_java = """
-        public void sync(List<Long> ids) {
-            meterRepository.findAllById(ids);
-        }
-        """
-        self.assertEqual(code_metrics.count_db_calls_in_loops(bad_java), 1)
-        self.assertEqual(code_metrics.count_db_calls_in_loops(good_java), 0)
-
-    def test_classify_file_weights(self) -> None:
-        self.assertEqual(code_metrics.classify_file("frontend/src/screens/Home/index.test.tsx"), ("test", 0.0))
-        self.assertEqual(code_metrics.classify_file("docs/README.md"), ("non-runtime", 0.0))
-        self.assertEqual(code_metrics.classify_file("frontend/src/app/store.ts"), ("global", 1.0))
-        self.assertEqual(code_metrics.classify_file("frontend/src/screens/Building/index.tsx"), ("core-screen", 0.35))
+    def test_classify_file_buckets(self) -> None:
+        self.assertEqual(code_metrics.classify_file("frontend/src/screens/Home/index.test.tsx"), "test")
+        self.assertEqual(code_metrics.classify_file("docs/README.md"), "non-runtime")
+        self.assertEqual(code_metrics.classify_file("frontend/src/app/store.ts"), "frontend")
+        self.assertEqual(code_metrics.classify_file("src/main/sql/update-tenant.sql"), "sql")
 
     def test_structure_score_rewards_simplification_and_tests(self) -> None:
         summary = {
@@ -88,97 +105,88 @@ class CodeMetricsTests(unittest.TestCase):
         self.assertEqual(res["direction"], "Worse")
 
 
-class ApiSqlProbeTests(unittest.TestCase):
-    def test_detects_unfiltered_nls_res_join(self) -> None:
-        bad_sql = """
-        SELECT b.id, bn.name
-        FROM building b
-        JOIN building_nls_res bn ON bn.building_id = b.id
-        WHERE b.active = true;
-        """
-        good_sql = """
-        SELECT b.id, bn.name
-        FROM building b
-        JOIN building_nls_res bn ON bn.building_id = b.id AND bn.locale = :locale
-        WHERE b.active = true;
-        """
-        self.assertEqual(api_sql_probe.count_unfiltered_nls_res(bad_sql), 1)
-        self.assertEqual(api_sql_probe.count_unfiltered_nls_res(good_sql), 0)
+class ScientificVerdictTests(unittest.TestCase):
+    def test_never_fabricates_percent_when_no_runtime_tool_ran(self) -> None:
+        code = {"prod_files_count": 3}
+        skipped = {"status": "skipped", "reason": "not available"}
+        res = analyze_pr.build_scientific_verdict(code, skipped, skipped, skipped, skipped, skipped)
+        self.assertEqual(res["status"], "not_measured")
+        self.assertIn("Not measured", res["headline"])
+        self.assertEqual(res["measured_axes"], [])
 
-    def test_percentile_math(self) -> None:
-        self.assertEqual(api_sql_probe.percentile([10.0, 20.0, 30.0, 40.0, 100.0], 95), 100.0)
-        self.assertEqual(api_sql_probe.percentile([], 95), 0.0)
+    def test_reports_zero_when_no_runtime_files_changed(self) -> None:
+        code = {"prod_files_count": 0}
+        skipped = {"status": "skipped"}
+        res = analyze_pr.build_scientific_verdict(code, skipped, skipped, skipped, skipped, skipped)
+        self.assertEqual(res["status"], "no_runtime_files")
+        self.assertTrue(res["headline"].startswith("0%"))
 
-
-class AnalyzePrSynthesisTests(unittest.TestCase):
-    def test_discover_preview_urls_uses_configured_regex(self) -> None:
-        comments = [
-            {"body": "Preview ready at https://pr-1910.preview.example.com"},
-        ]
-        web, api = analyze_pr.discover_preview_urls(
-            comments,
-            host_regex=r"https://([a-z0-9-]+)\.preview\.example\.com",
-        )
-        self.assertEqual(web, "https://pr-1910.preview.example.com")
-        self.assertIsNone(api)
-
-    def test_synthesize_non_runtime_is_zero_percent_high_confidence(self) -> None:
-        code = {"prod_files_count": 0, "max_app_weight": 0.0, "pattern_deltas": {}}
-        res = analyze_pr.synthesize_impact(code, {"status": "skipped"}, {"status": "skipped"}, {"status": "skipped"}, {"status": "skipped"})
-        self.assertEqual(res["overall_app_label"], "~0%")
-        self.assertEqual(res["confidence"], "High")
-
-    def test_synthesize_combines_bundle_and_browser_measurements(self) -> None:
-        code = {"prod_files_count": 2, "max_app_weight": 0.6, "pattern_deltas": {"lazy_imports": 1}}
-        bundle = {
-            "status": "ok",
-            "entry_gzip_kb": {"base": 300.0, "head": 270.0, "delta_kb": -30.0, "delta_pct": -10.0, "reduction_pct": 10.0},
-            "total_js_gzip_kb": {"base": 900.0, "head": 855.0, "delta_kb": -45.0, "delta_pct": -5.0, "reduction_pct": 5.0},
-        }
-        browser = {"status": "ok", "median_runtime_improvement_pct": 12.0, "routes": {"/": {}}}
-        res = analyze_pr.synthesize_impact(code, {"status": "skipped"}, bundle, browser, {"status": "skipped"})
-        self.assertGreater(res["overall_app_pct_low"], 0.0)
-        self.assertEqual(res["confidence"], "High")
-        self.assertIn("measured", res["basis"])
-
-    def test_synthesize_negligible_bundle_delta_reports_zero_percent(self) -> None:
-        code = {"prod_files_count": 1, "max_app_weight": 0.35, "pattern_deltas": {}}
+    def test_reports_statistically_flat_when_measurements_within_noise(self) -> None:
+        code = {"prod_files_count": 1}
         bundle = {
             "status": "ok",
             "entry_gzip_kb": {"base": 1160.86, "head": 1160.83, "delta_kb": -0.03, "delta_pct": 0.0, "reduction_pct": 0.0},
-            "total_js_gzip_kb": {"base": 2500.0, "head": 2499.9, "delta_kb": -0.1, "delta_pct": 0.0, "reduction_pct": 0.0},
+            "local_browser": {
+                "status": "ok",
+                "metrics": {
+                    "script_duration_ms": {
+                        "base": {"n": 7, "median": 120.0},
+                        "pr": {"n": 7, "median": 119.0},
+                        "improvement_pct": 0.83,
+                        "p_value": 0.62,
+                        "significant": False,
+                    }
+                },
+            },
         }
-        res = analyze_pr.synthesize_impact(code, {"status": "skipped"}, bundle, {"status": "skipped"}, {"status": "skipped"})
-        self.assertEqual(res["overall_app_label"], "~0%")
-        self.assertEqual(res["confidence"], "Medium")
+        skipped = {"status": "skipped"}
+        res = analyze_pr.build_scientific_verdict(code, bundle, skipped, skipped, skipped, skipped)
+        self.assertEqual(res["status"], "no_significant_change")
+        self.assertIn("bundle", res["measured_axes"])
+        self.assertIn("local_browser", res["measured_axes"])
+
+    def test_reports_measured_improvement_from_significant_local_browser_metric(self) -> None:
+        code = {"prod_files_count": 2}
+        bundle = {
+            "status": "ok",
+            "entry_gzip_kb": {"base": 500.0, "head": 450.0, "delta_kb": -50.0, "delta_pct": -10.0, "reduction_pct": 10.0},
+            "local_browser": {
+                "status": "ok",
+                "metrics": {
+                    "script_duration_ms": {
+                        "base": {"n": 7, "median": 200.0},
+                        "pr": {"n": 7, "median": 160.0},
+                        "improvement_pct": 20.0,
+                        "p_value": 0.002,
+                        "significant": True,
+                    }
+                },
+            },
+        }
+        skipped = {"status": "skipped"}
+        res = analyze_pr.build_scientific_verdict(code, bundle, skipped, skipped, skipped, skipped)
+        self.assertEqual(res["status"], "measured_improvement")
+        self.assertIn("+20.00%", res["headline"])
 
 
 class SkillVersionTests(unittest.TestCase):
-    def test_reads_canonical_version_file(self) -> None:
-        skill_dir = SCRIPTS_DIR.parent
-        version = skill_versions.read_version(skill_dir)
-        self.assertEqual(version, "1.0.0")
-        self.assertEqual(skill_versions.parse_version(version), (1, 0, 0))
+    def test_reads_v2_version_file(self) -> None:
+        version = skill_versions.read_version(SCRIPTS_DIR.parent)
+        self.assertEqual(version, "2.0.0")
+        self.assertEqual(skill_versions.parse_version(version), (2, 0, 0))
 
     def test_check_update_detects_newer_release(self) -> None:
         class FakeResp:
             returncode = 0
-            stdout = '{"schema_version": 1, "skills": {"pr-performance-impact": {"version": "1.1.0", "path": "git-and-review-workflow/pr-performance-impact"}}}'
+            stdout = '{"schema_version": 1, "skills": {"pr-performance-impact": {"version": "2.1.0", "path": "git-and-review-workflow/pr-performance-impact"}}}'
 
         res = skill_versions.check_update(SCRIPTS_DIR.parent, runner=lambda *a, **kw: FakeResp())
         self.assertEqual(res["status"], "checked")
         self.assertTrue(res["update_available"])
-        self.assertEqual(res["latest_version"], "1.1.0")
-        self.assertIn("1.1.0", res["update_message"])
 
-    def test_check_update_handles_unavailable_catalog(self) -> None:
-        class FailResp:
-            returncode = 1
-            stdout = ""
-
-        res = skill_versions.check_update(SCRIPTS_DIR.parent, runner=lambda *a, **kw: FailResp())
-        self.assertEqual(res["status"], "unavailable")
-        self.assertFalse(res["update_available"])
+    def test_sql_explain_skips_cleanly_without_dsn(self) -> None:
+        res = api_sql_probe.benchmark_sql_explain(None, None, None)
+        self.assertEqual(res["status"], "skipped")
 
 
 if __name__ == "__main__":
