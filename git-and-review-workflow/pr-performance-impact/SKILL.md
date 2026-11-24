@@ -12,10 +12,11 @@ Produce a short, read-only, tool-backed scorecard for one pull request: estimate
 Run the unified orchestrator from this skill's directory against the target repository (read-only; never modifies your checkout):
 
 ```bash
-python3 <skill-dir>/scripts/analyze_pr.py <PR_NUMBER_OR_URL> --repo . --json
+python3 <skill-dir>/scripts/analyze_pr.py <PR_NUMBER_OR_URL> --repo . --check-updates --json
 ```
 
 Omit `<PR_NUMBER_OR_URL>` to target the current branch's PR. Optional flags:
+- `--check-updates` — reads the local `VERSION` file (`MAJOR.MINOR.PATCH`) and checks `alchambron/skills/skill-versions.json` on `main` via `gh api` (read-only, non-blocking). If a newer release exists, mention the update notice in 1 short line without installing anything.
 - `--pr-url <url> --base-url <url> --routes /,/dashboard --login` — run live Playwright Web Vitals benchmarking on specific routes (also reads `PR_PERF_BASE_WEB_URL`, `PR_PERF_PREVIEW_HOST_REGEX`).
 - `--pr-api <url> --base-api <url> --endpoints /api/...` — run live HTTP latency benchmarking (`median` / `p95` ms and payload bytes; also reads `PR_PERF_BASE_API_URL` and optional `PR_PERF_AUTH_TOKEN`).
 - `--no-bundle` / `--no-browser` / `--no-api` — skip individual tools when not needed.

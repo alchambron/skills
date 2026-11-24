@@ -13,6 +13,7 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 import analyze_pr  # noqa: E402
 import api_sql_probe  # noqa: E402
 import code_metrics  # noqa: E402
+import skill_versions  # noqa: E402
 
 
 class CodeMetricsTests(unittest.TestCase):
@@ -150,6 +151,34 @@ class AnalyzePrSynthesisTests(unittest.TestCase):
         res = analyze_pr.synthesize_impact(code, {"status": "skipped"}, bundle, {"status": "skipped"}, {"status": "skipped"})
         self.assertEqual(res["overall_app_label"], "~0%")
         self.assertEqual(res["confidence"], "Medium")
+
+
+class SkillVersionTests(unittest.TestCase):
+    def test_reads_canonical_version_file(self) -> None:
+        skill_dir = SCRIPTS_DIR.parent
+        version = skill_versions.read_version(skill_dir)
+        self.assertEqual(version, "1.0.0")
+        self.assertEqual(skill_versions.parse_version(version), (1, 0, 0))
+
+    def test_check_update_detects_newer_release(self) -> None:
+        class FakeResp:
+            returncode = 0
+            stdout = '{"schema_version": 1, "skills": {"pr-performance-impact": {"version": "1.1.0", "path": "git-and-review-workflow/pr-performance-impact"}}}'
+
+        res = skill_versions.check_update(SCRIPTS_DIR.parent, runner=lambda *a, **kw: FakeResp())
+        self.assertEqual(res["status"], "checked")
+        self.assertTrue(res["update_available"])
+        self.assertEqual(res["latest_version"], "1.1.0")
+        self.assertIn("1.1.0", res["update_message"])
+
+    def test_check_update_handles_unavailable_catalog(self) -> None:
+        class FailResp:
+            returncode = 1
+            stdout = ""
+
+        res = skill_versions.check_update(SCRIPTS_DIR.parent, runner=lambda *a, **kw: FailResp())
+        self.assertEqual(res["status"], "unavailable")
+        self.assertFalse(res["update_available"])
 
 
 if __name__ == "__main__":

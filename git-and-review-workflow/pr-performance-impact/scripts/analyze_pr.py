@@ -28,6 +28,9 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 import api_sql_probe  # noqa: E402
 import code_metrics  # noqa: E402
+import skill_versions  # noqa: E402
+
+SKILL_DIR = SCRIPT_DIR.parent
 
 
 def run_cmd(cmd: List[str], cwd: str, check: bool = True, timeout: int = 300) -> subprocess.CompletedProcess:
@@ -291,8 +294,15 @@ def main() -> int:
     parser.add_argument("--endpoints", default="/actuator/health", help="Comma-separated API endpoints to probe")
     parser.add_argument("--runs", type=int, default=3, help="Measured iterations per route/endpoint")
     parser.add_argument("--login", action="store_true", help="Attempt login with .env test credentials in browser bench")
+    parser.add_argument("--check-updates", action="store_true", help="Check published skill-versions.json for newer releases")
     parser.add_argument("--json", action="store_true", help="Output full structured JSON")
     args = parser.parse_args()
+
+    try:
+        installed_version = skill_versions.read_version(SKILL_DIR)
+    except (OSError, ValueError):
+        installed_version = None
+    update_info = skill_versions.check_update(SKILL_DIR) if args.check_updates else None
 
     repo_root = resolve_repo_root(args.repo)
     pr = fetch_pr_metadata(repo_root, args.target)
@@ -356,6 +366,11 @@ def main() -> int:
     synthesis = synthesize_impact(code_res, sql_res, bundle_res, browser_res, api_res)
 
     report = {
+        "skill": {
+            "name": skill_versions.SKILL_NAME,
+            "version": installed_version,
+            "update_check": update_info,
+        },
         "pr": {
             "number": pr_number,
             "title": pr.get("title"),
