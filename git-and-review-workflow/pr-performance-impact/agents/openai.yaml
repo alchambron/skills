@@ -1,0 +1,4 @@
+interface:
+  display_name: "PR Performance Impact"
+  short_description: "Short PR scorecard for overall app performance impact (%) and structure (/10)"
+  default_prompt: "Use $pr-performance-impact to give a short scorecard of this PR's overall app performance impact (%) and structure score (/10)."
