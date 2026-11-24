@@ -1,11 +1,15 @@
 ---
 name: respond
-description: Analyze PR feedback in a delegated phase and, when authorized, fix it, publish replies, request reviewers and monitor CI. Use for PR comments, reviewer requests or feedback plans.
+description: Respond to feedback on a named owned PR through fixes, publication and CI handoff. Also prepare read-only PR feedback plans.
 ---
 
 # Respond to PR feedback
 
-A bare `/respond` or `$respond` requests a plan. Resolve the target from the supplied URL/number or current branch. Read target-repository instructions. Reuse the user's established authorization for code, commit/push, replies, reviewer requests, CI actions and thread resolution; explicit limits remain binding. A push, merge, approval and deployment are separate actions. Prepare excluded steps as drafts and continue permitted work.
+For a direct `/respond PR` or `$respond PR` invocation, a specific PR number or URL authorizes the [standalone workflow](references/standalone.md) on that verified owned PR. Analyze its feedback, apply in-scope fixes, verify, commit and push, publish replies, re-request addressed human reviewers, and hand off exact-head CI. Apply the user's explicit limits. Treat the analysis as a checkpoint and continue in the same run.
+
+A bare invocation without a target plans against the current branch. An explicit plan-only or read-only request always plans, including when it names a PR. Keep that phase to reads and local report artifacts. Later approval such as “Go for it!” authorizes the concrete plan's actions, subject to its explicit limits. Continue from that plan without asking for the same approval again.
+
+For calls from `respond-all` or `respond-queue`, use the calling workflow's authorization and limits. The named-PR default applies only to direct standalone invocations. Merge, review approval, thread resolution and deployment each require separate authority in every mode.
 
 ## Phase ownership
 
@@ -14,7 +18,7 @@ The parent schedules work, records compact ledger results, presents rendered pla
 - Read-only analyzer: [references/analyzer.md](references/analyzer.md), with [report schema](references/report-schema.md). It writes the analysis and coverage inventory.
 - One fixer per PR: [references/fixer.md](references/fixer.md). It implements approved rows and owns authorized push, replies and reviewer requests.
 
-Use native subagents for supported same-provider work and T3 `delegate_task` for isolation, other providers or requested settings. Follow the tool's orchestration/continuation instructions. A fixer needs an isolated checkout with one writer, assigned exact head and stable request ID. If delegation is unavailable, report that blocker. Delegation adds no authorization.
+Use native subagents for supported same-provider work and T3 `delegate_task` for isolation, other providers or requested settings. Follow the tool's orchestration/continuation instructions. A fixer needs an isolated checkout with one writer, assigned exact head and stable request ID. For standalone work, carry the [standalone checks](references/standalone.md) and in-scope row IDs into the fixer brief. If delegation is unavailable, continue standalone locally when the phases and checkout can be isolated safely. Otherwise report the blocker. Delegation adds no authorization.
 
 A brief carries variables, not copied instructions: role/reference, PR URL/head/base, untouched or approved row IDs, run directory, exact authorization/limits, and resource slot. Start every child with clean context: native Codex agents get `fork_turns: "none"`, since a forked child re-reads the parent's history on every step. Source, logs and full reports stay on disk; each result is one line with PR URL, head, outcome, artifact path and remaining objections.
 
