@@ -44,6 +44,10 @@
     "update-from-work": {
       "version": "1.4.0",
       "path": "git-and-review-workflow/update-from-work"
+    },
+    "gh-event-wait": {
+      "version": "1.0.0",
+      "path": "git-and-review-workflow/gh-event-wait"
     }
   }
 }
