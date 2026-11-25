@@ -377,6 +377,159 @@ def html_data(data, output_dir, inline):
     return result
 
 
+def md_cell(value, limit=None):
+    if isinstance(value, (dict, list)):
+        value = json.dumps(value, ensure_ascii=False)
+    text = " ".join(str(value or "").split()).replace("|", "\\|")
+    if limit and len(text) > limit:
+        text = text[: limit - 1] + "…"
+    return text or "—"
+
+
+def _finding_location(finding):
+    path = finding.get("path")
+    line = finding.get("line")
+    if path and line is not None:
+        return f"`{md_cell(path)}:{line}`"
+    if path:
+        return f"`{md_cell(path)}`"
+    return "—"
+
+
+def _scenario_summary(pr):
+    live = pr.get("live") or {}
+    status = live.get("display_status") or live.get("status") or "pending"
+    scenarios = pr.get("scenarios") or []
+    if not scenarios:
+        reason = live.get("reason")
+        return f"{status} ({md_cell(reason, 100)})" if reason else status
+    counts = {}
+    for scenario in scenarios:
+        st = scenario.get("display_status") or scenario.get("status") or "unknown"
+        counts[st] = counts.get(st, 0) + 1
+    parts = ", ".join(f"{count} {name}" for name, count in counts.items())
+    return f"{status} ({parts})"
+
+
+def _publication_cell(pr):
+    pub = pr.get("publication") or {}
+    status = pub.get("display_status") or pub.get("status") or "pending"
+    review_url = pub.get("review_url")
+    if review_url:
+        return f"[{md_cell(status)}]({review_url})"
+    reused = pub.get("reused_threads") or []
+    if reused:
+        return f"{md_cell(status)} ({len(reused)} thread(s))"
+    return md_cell(status)
+
+
+def render_markdown(data, output_dir):
+    """Render a T3-ready inline Markdown review summary alongside the HTML reports."""
+    output_dir = Path(output_dir).resolve()
+    guide_path = output_dir / "scenario-guide.html"
+    inline_path = output_dir / "inline-report.html"
+    summary_path = output_dir / "summary.md"
+    lines = [
+        "| PR | Verdict | Findings | Publication | Live acceptance | Report |",
+        "| --- | --- | --- | --- | --- | --- |",
+    ]
+    for pr in data.get("prs", []):
+        key = f"{pr['repository']}#{pr['number']}"
+        title = f"{key} — {md_cell(pr.get('title'), 70)}" if pr.get("title") else key
+        verdict = (pr.get("review") or {}).get("status", "pending")
+        freshness = pr.get("freshness", "unknown")
+        verdict_cell = verdict if freshness == "current" else f"{verdict} ({freshness})"
+        findings = (pr.get("review") or {}).get("findings") or []
+        lines.append(
+            f"| [{title}]({pr['url']}) | {md_cell(verdict_cell)} | {len(findings)} | "
+            f"{_publication_cell(pr)} | {md_cell(_scenario_summary(pr), 120)} | "
+            f"[HTML]({guide_path}) |"
+        )
+    if not data.get("prs"):
+        lines.append("| No PRs selected | — | 0 | — | — | — |")
+
+    for pr in data.get("prs", []):
+        key = f"{pr['repository']}#{pr['number']}"
+        title = f"{key} — {md_cell(pr.get('title'), 90)}" if pr.get("title") else key
+        review = pr.get("review") or {}
+        pub = pr.get("publication") or {}
+        live = pr.get("live") or {}
+        head = pr.get("head_sha") or "unavailable"
+        base = pr.get("base_sha") or "unavailable"
+        actions = "; ".join(action.get("label", "") for action in pr.get("next_actions") or [] if action.get("label"))
+        lines.extend([
+            "",
+            f"## [{title}]({pr['url']})",
+            "",
+            f"- **Verdict:** `{review.get('status', 'pending')}` · **Freshness:** `{pr.get('freshness', 'unknown')}`"
+            f" · **Pins:** head `{head[:12]}` / base `{base[:12]}`",
+        ])
+        if actions:
+            lines.append(f"- **Next actions:** {md_cell(actions)}")
+
+        findings = review.get("findings") or []
+        lines.extend(["", "### Findings", ""])
+        if findings:
+            lines.extend([
+                "| Severity | Location | Origin | Finding | Link |",
+                "| --- | --- | --- | --- | --- |",
+            ])
+            for finding in findings:
+                link = finding.get("thread_url") or finding.get("url")
+                link_cell = f"[thread]({link})" if link else "—"
+                summary = finding.get("title") or ""
+                detail = finding.get("body") or ""
+                text = f"{summary}: {detail}" if summary and detail else (summary or detail)
+                lines.append(
+                    f"| {md_cell(finding.get('severity') or '—')} | {_finding_location(finding)} | "
+                    f"{md_cell(finding.get('origin') or 'static')} | {md_cell(text, 240)} | {link_cell} |"
+                )
+        else:
+            lines.append("No verified actionable findings.")
+
+        scenarios = pr.get("scenarios") or []
+        lines.extend(["", "### Live acceptance", ""])
+        live_status = live.get("display_status") or live.get("status") or "pending"
+        live_detail = f"Status: `{live_status}`"
+        if live.get("scope"):
+            live_detail += f" · scope `{live['scope']}`"
+        if live.get("runtime_commit"):
+            live_detail += f" · runtime `{str(live['runtime_commit'])[:12]}`"
+        if live.get("cleanup_status"):
+            live_detail += f" · cleanup `{live['cleanup_status']}`"
+        if live.get("reason"):
+            live_detail += f" — {md_cell(live['reason'])}"
+        lines.append(live_detail)
+        if scenarios:
+            lines.extend([
+                "",
+                "| ID | Status | Route | Scenario | Actual |",
+                "| --- | --- | --- | --- | --- |",
+            ])
+            for scenario in scenarios:
+                lines.append(
+                    f"| `{md_cell(scenario.get('id'))}` | {md_cell(scenario.get('display_status') or scenario.get('status'))} | "
+                    f"`{md_cell(scenario.get('route'))}` | {md_cell(scenario.get('title'), 100)} | "
+                    f"{md_cell(scenario.get('actual'), 200)} |"
+                )
+
+        lines.extend(["", "### Links", ""])
+        lines.append(f"- PR: [{key}]({pr['url']})")
+        review_url = pub.get("review_url")
+        reused_threads = pub.get("reused_threads") or []
+        if review_url:
+            lines.append(f"- GitHub review: [{review_url}]({review_url}) (`{pub.get('display_status', pub.get('status'))}`)")
+        elif reused_threads:
+            joined = ", ".join(f"[thread {i}]({u})" for i, u in enumerate(reused_threads, 1))
+            lines.append(f"- GitHub review threads ({pub.get('display_status', pub.get('status'))}): {joined}")
+        else:
+            lines.append(f"- GitHub review: none (`{pub.get('display_status', pub.get('status', 'pending'))}`)")
+        lines.append(f"- HTML report: [scenario-guide.html]({guide_path}) · [inline-report.html]({inline_path})")
+        lines.append(f"- Markdown summary: [summary.md]({summary_path})")
+
+    return "\n".join(lines) + "\n"
+
+
 def render(input_path, output_dir):
     input_path = Path(input_path).resolve()
     output_dir = Path(output_dir).resolve()
@@ -388,16 +541,31 @@ def render(input_path, output_dir):
     template = (Path(__file__).resolve().parent.parent / "assets" / "report.html").read_text(encoding="utf-8")
     for name, inline in (("scenario-guide.html", False), ("inline-report.html", True)):
         (output_dir / name).write_text(template.replace("__REPORT_JSON__", safe_json(html_data(data, output_dir, inline))), encoding="utf-8")
-    return {"guide": str(output_dir / "scenario-guide.html"), "inline": str(output_dir / "inline-report.html"), "results": str(output_dir / "results.json"), "pr_count": len(data["prs"]), **data["report"]}
+    markdown_path = output_dir / "summary.md"
+    markdown_path.write_text(render_markdown(data, output_dir), encoding="utf-8")
+    return {
+        "guide": str(output_dir / "scenario-guide.html"),
+        "inline": str(output_dir / "inline-report.html"),
+        "markdown": str(markdown_path),
+        "results": str(output_dir / "results.json"),
+        "pr_count": len(data["prs"]),
+        **data["report"],
+    }
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--print-markdown", action="store_true",
+                        help="Print the rendered inline Markdown summary instead of JSON")
     args = parser.parse_args()
     try:
-        print(json.dumps(render(args.input, args.output)))
+        summary = render(args.input, args.output)
+        if args.print_markdown:
+            print(Path(summary["markdown"]).read_text(encoding="utf-8"), end="")
+        else:
+            print(json.dumps(summary))
     except (ValueError, OSError, TypeError, KeyError) as exc:
         print(json.dumps({"error": str(exc)}), file=sys.stderr)
         return 2

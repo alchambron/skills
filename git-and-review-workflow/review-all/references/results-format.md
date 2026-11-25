@@ -1,6 +1,6 @@
 # Saved results contract
 
-Use `results.json` as the coordinator's resumable ledger. Collection writes `snapshot.json` and per-PR raw artifacts; initialize the ledger from that snapshot and checkpoint outcomes with `scripts/ledger.py`. The helper locks updates, validates them, and atomically replaces the ledger. Child agents write separate payload files; the coordinator records them. Run `scripts/render_results.py --input RUN_DIR/results.json --output RUN_DIR/report` to create the illustrated report.
+Use `results.json` as the coordinator's resumable ledger. Collection writes `snapshot.json` and per-PR raw artifacts; initialize the ledger from that snapshot and checkpoint outcomes with `scripts/ledger.py`. The helper locks updates, validates them, and atomically replaces the ledger. Child agents write separate payload files; the coordinator records them. Run `scripts/render_results.py --input RUN_DIR/results.json --output RUN_DIR/report` to create `scenario-guide.html`, `inline-report.html`, `summary.md` (inline Markdown summary with verdict, `file:line` findings, live scenarios, GitHub review links, and HTML report links; pass `--print-markdown` to print it to stdout), and the prepared `report/results.json`.
 
 The top-level object contains `version: 1`, `login`, `collected_at`, optional `collection` with `complete` and `warnings`, and a `prs` array. Each PR has:
 

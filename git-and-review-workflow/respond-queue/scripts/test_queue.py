@@ -346,20 +346,30 @@ class CliTests(Contexts):
         self.assertEqual(code, 2)
         self.assertIn('reserved by review-queue', out['reason'])
 
+        # Same PR number in a different repository is NOT a duplicate reservation,
+        # but still counts toward the combined shared slot caps across repositories.
         jobs.write_text(json.dumps({'jobs': {
-            'static1': {'status': 'active', 'phase': 'static', 'number': 2},
-            'static2': {'status': 'active', 'phase': 'static', 'number': 3},
+            'other_repo_parked': {'status': 'active', 'phase': 'waiting_live',
+                                  'repository': 'EnerZam/WebSynco_React_Front', 'number': 1},
+        }}))
+        code, out = self.claim()
+        self.assertEqual(code, 0)
+        self.assertEqual(self.finish(out['token'], {'status': 'analyzed'}), 0)
+
+        jobs.write_text(json.dumps({'jobs': {
+            'static1': {'status': 'active', 'phase': 'static',
+                        'repository': 'EnerZam/WebSynco_React_Front', 'number': 132},
+            'static2': {'status': 'active', 'phase': 'static',
+                        'repository': 'EnerZam/WebSynco', 'number': 80},
         }}))
         code, out = self.claim()
         self.assertEqual(code, 2)
         self.assertIn('shared static resource cap', out['reason'])
 
         jobs.write_text(json.dumps({'jobs': {
-            'runtime': {'status': 'active', 'phase': 'live', 'number': 2},
+            'runtime': {'status': 'active', 'phase': 'live',
+                        'repository': 'EnerZam/WebSynco_React_Front', 'number': 132},
         }}))
-        code, out = self.claim()
-        self.assertEqual(code, 0)
-        self.assertEqual(self.finish(out['token'], {'status': 'analyzed'}), 0)
         code, out = self.claim('fix')
         self.assertEqual(code, 2)
         self.assertIn('shared live resource cap', out['reason'])
