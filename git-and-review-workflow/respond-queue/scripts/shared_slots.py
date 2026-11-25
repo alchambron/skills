@@ -5,12 +5,20 @@ import fcntl
 import json
 
 
+DEFAULT_REPOSITORY = 'EnerZam/JouleMV'
 PHASES = {
     'respond-queue': {'analysis': 'static', 'fix': 'live'},
     'review-queue': {'static': 'static', 'live': 'live', 'waiting_live': None},
     'update-from-work': {'update': 'live'},
 }
 CAPACITY = {'static': 2, 'live': 1}
+
+
+def pr_identity(number, repository=None):
+    repo = repository or DEFAULT_REPOSITORY
+    if not isinstance(repo, str) or not repo.strip():
+        raise ValueError('invalid repository in shared slot state')
+    return repo.strip().casefold(), number
 
 
 @contextmanager
@@ -39,20 +47,23 @@ def active_peer_jobs(path, queue):
         if job['status'] == 'active':
             number = job.get('number')
             phase = job.get('phase')
-            if type(number) is not int or number < 1 or not isinstance(phase, str) or phase not in PHASES[queue]:
+            repository = job.get('repository')
+            if (type(number) is not int or number < 1 or not isinstance(phase, str) or phase not in PHASES[queue]
+                    or (repository is not None and (not isinstance(repository, str) or not repository.strip()))):
                 raise ValueError(f'invalid shared slot state {path}: malformed active job {token}')
             active.append(job)
     return active
 
 
-def check_capacity(root, queue, phase, number, jobs):
+def check_capacity(root, queue, phase, number, jobs, repository=None):
     """Call with the shared lock held and this queue's current active jobs."""
     slot = PHASES[queue][phase]
+    target = pr_identity(number, repository)
     counts = dict.fromkeys(CAPACITY, 0)
     for owner, phases in PHASES.items():
         active = jobs if owner == queue else active_peer_jobs(root.parent / owner / 'state.json', owner)
         for job in active:
-            if job['number'] == number:
+            if pr_identity(job['number'], job.get('repository')) == target:
                 raise ValueError(f'PR already reserved by {owner}')
             category = phases[job['phase']]
             if category:

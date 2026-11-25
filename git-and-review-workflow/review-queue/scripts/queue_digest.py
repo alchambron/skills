@@ -10,7 +10,7 @@ import tempfile
 from zoneinfo import ZoneInfo
 
 
-REPOSITORY = 'EnerZam/JouleMV'
+DEFAULT_REPOSITORY = 'EnerZam/JouleMV'
 TORONTO = ZoneInfo('America/Toronto')
 
 
@@ -20,29 +20,55 @@ def digest_date(timestamp: datetime) -> date:
     return timestamp.astimezone(TORONTO).date()
 
 
+def repo_of(row):
+    repo = row.get('repository')
+    return repo if isinstance(repo, str) and repo.strip() else DEFAULT_REPOSITORY
+
+
+def pr_key_of(row):
+    existing = row.get('pr_key')
+    if isinstance(existing, str) and '#' in existing:
+        return existing
+    number = row.get('pr') if row.get('pr') is not None else row.get('number')
+    if number is None:
+        return None
+    return f'{repo_of(row)}#{number}'
+
+
 def review_result(token, job, result):
+    repo = repo_of(job)
     number = job['number']
+    key = f'{repo}#{number}'
     outcome = result['status']
-    path = result['html_path']
+    path = result.get('html_path')
+    ping_alexis = bool(result.get('ping_alexis'))
     if outcome == 'completed' and path:
-        if result.get('verdict') == 'issues':
-            ping = f'#{number} changes requested, see report'
+        if ping_alexis:
+            ping = f'{key} re-requested at reviewed head, needs Alexis decision'
+        elif result.get('verdict') == 'issues':
+            ping = f'{key} changes requested, see report'
         else:
-            ping = f'#{number} review ready, check before approving'
+            ping = f'{key} review ready, check before approving'
     else:
         label = 'incomplete' if outcome == 'completed' else outcome
         detail = 'see report' if path else 'report unavailable'
-        ping = f'#{number} review {label}, {detail}'
+        ping = f'{key} review {label}, {detail}'
     return {
         'token': token,
+        'repository': repo,
+        'pr_key': key,
         'pr': number,
+        'url': job.get('url') or f'https://github.com/{repo}/pull/{number}',
         'head_sha': job['pins']['head'],
         'base_sha': job['pins']['base'],
         'outcome': outcome,
         'verdict': result['verdict'],
         'html_path': path,
+        'summary_path': result.get('summary_path'),
+        'review_url': result.get('review_url'),
         'finished_at': job['finished_at'],
         'ping': ping,
+        'ping_alexis': ping_alexis,
         'reason': result.get('reason'),
         'live': result.get('live'),
         'publication': result.get('publication'),
@@ -51,24 +77,65 @@ def review_result(token, job, result):
     }
 
 
+def _normalize_skip(row):
+    item = dict(row)
+    number = item.get('number')
+    if number is not None:
+        repo = repo_of(item)
+        item['repository'] = repo
+        item['pr_key'] = pr_key_of(item)
+    return item
+
+
+def _dedupe_skips(skips):
+    seen = set()
+    unique = []
+    for row in skips:
+        identity = (
+            row.get('pr_key'),
+            row.get('command'),
+            row.get('reason'),
+            row.get('head'),
+            row.get('base'),
+        )
+        if identity in seen:
+            continue
+        seen.add(identity)
+        unique.append(row)
+    return unique
+
+
 def snapshot(state, day):
     reviews, reservations = [], []
     for token, job in state['jobs'].items():
         if job['status'] == 'active':
-            reservations.append({**job, 'token': token})
+            repo = repo_of(job)
+            reservations.append({**job, 'token': token, 'repository': repo, 'pr_key': pr_key_of(job)})
         elif job['status'] == 'finished' and job.get('result'):
             if digest_date(datetime.fromisoformat(job['finished_at'])) == day:
                 reviews.append(review_result(token, job, job['result']))
     reviews.sort(key=lambda row: datetime.fromisoformat(row['finished_at']), reverse=True)
+    raw_skips = [
+        _normalize_skip(row)
+        for row in state.get('skips', [])
+        if isinstance(row, dict) and row.get('at') and digest_date(datetime.fromisoformat(row['at'])) == day
+    ]
+    skips = _dedupe_skips(raw_skips)
+    repos_by_lower = {}
+    for collection in (reviews, reservations, skips):
+        for row in collection:
+            repo = row.get('repository')
+            if isinstance(repo, str) and repo.strip():
+                repos_by_lower.setdefault(repo.casefold(), repo)
+    repositories = sorted(repos_by_lower.values(), key=str.casefold)
     return {
-        'schema_version': 1,
+        'schema_version': 2,
         'date': day.isoformat(),
         'generated_at': datetime.now(timezone.utc).isoformat(),
-        'repository': REPOSITORY,
+        'repositories': repositories,
         'reviews': reviews,
         'reservations': reservations,
-        'skips': [row for row in state.get('skips', [])
-                  if row.get('at') and digest_date(datetime.fromisoformat(row['at'])) == day],
+        'skips': skips,
     }
 
 
@@ -78,28 +145,49 @@ def one_line(value):
     return re.sub(r'([\\`*_\[\]~])', r'\\\1', escaped)
 
 
+def safe_url(value):
+    text = str(value).strip()
+    if text.startswith('https://') and not re.search(r'[\s<>"\'`\\]', text):
+        return f'<{text}>'
+    return one_line(text)
+
+
+def safe_path(value):
+    plain = ' '.join(str(value).split())
+    if '`' not in plain and '<' not in plain and '>' not in plain:
+        return f'`{plain}`'
+    return one_line(plain)
+
+
 def render_markdown(data):
     lines = [f"# Review queue for {data['date']}", '']
     pings = {}
     for row in data['reviews']:
-        pings.setdefault(row['pr'], row['ping'])
+        key = row.get('pr_key') or f"{repo_of(row)}#{row['pr']}"
+        pings.setdefault(key.casefold(), row['ping'])
     lines.extend(f'- {ping}' for ping in pings.values())
 
     lines.extend(['', '## Recorded results', '', f"Exported {data['generated_at']}.", ''])
     if not data['reviews']:
         lines.append('No finished reviews recorded for this date.')
     for row in data['reviews']:
-        lines.append(f"- #{row['pr']} at {one_line(row['finished_at'])} · head {one_line(row['head_sha'])}"
+        key = row.get('pr_key') or f"{repo_of(row)}#{row['pr']}"
+        lines.append(f"- {one_line(key)} at {one_line(row['finished_at'])} · head {one_line(row['head_sha'])}"
                      f" · {one_line(row['outcome'])} · verdict {one_line(row['verdict'])}")
-        for label, value in (('Runtime', row['live']), ('Publication', row['publication']),
-                             ('Report', row['html_path']), ('Reason', row['reason'])):
+        for label, value, formatter in (('Runtime', row.get('live'), one_line),
+                                        ('Publication', row.get('publication'), one_line),
+                                        ('Review', row.get('review_url'), safe_url),
+                                        ('Report', row.get('html_path'), safe_path),
+                                        ('Summary', row.get('summary_path'), safe_path),
+                                        ('Reason', row.get('reason'), one_line)):
             if value:
-                lines.append(f'  - {label} · {one_line(value)}')
+                lines.append(f'  - {label} · {formatter(value)}')
 
     if data['reservations']:
         lines.extend(['', '## Active reservations at export', ''])
         for job in data['reservations']:
-            lines.append(f"- #{job['number']} · {one_line(job['phase'])} · thread {one_line(job['thread'])}"
+            key = pr_key_of(job) or f"#{job['number']}"
+            lines.append(f"- {one_line(key)} · {one_line(job['phase'])} · thread {one_line(job['thread'])}"
                          f" · token {one_line(job['token'])}")
             if job.get('defer_reason'):
                 lines.append(f"  - {one_line(job['defer_reason'])}")
@@ -107,7 +195,13 @@ def render_markdown(data):
     if data['skips']:
         lines.extend(['', '## Skips and deferrals', ''])
         for row in data['skips']:
-            target = f"#{row['number']} · " if row.get('number') else ''
+            key = pr_key_of(row)
+            if key:
+                target = f'{one_line(key)} · '
+            elif row.get('repository'):
+                target = f"{one_line(row['repository'])} · "
+            else:
+                target = ''
             lines.append(f"- {one_line(row['at'])} · {target}{one_line(row['reason'])}")
 
     return '\n'.join(lines) + '\n'

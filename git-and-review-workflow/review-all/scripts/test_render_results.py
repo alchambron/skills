@@ -611,6 +611,45 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(saved["live"]["display_status"], "not_required")
         self.assertEqual([action["kind"] for action in saved["next_actions"]], ["fixes"])
 
+    def test_render_writes_inline_markdown_summary_with_findings_scenarios_and_links(self):
+        data = ledger()
+        pr = data["prs"][0]
+        pr["repository"] = "EnerZam/WebSynco_React_Front"
+        pr["number"] = 132
+        pr["url"] = "https://github.com/EnerZam/WebSynco_React_Front/pull/132"
+        pr["review"] = {
+            "status": "issues",
+            "findings": [{
+                "severity": "P2",
+                "title": "Guard null date",
+                "body": "Throws when invoice date is missing",
+                "origin": "static",
+                "path": "src/pages/Invoices.tsx",
+                "line": 42,
+                "side": "RIGHT",
+                "thread_url": "https://github.com/EnerZam/WebSynco_React_Front/pull/132#discussion_r99",
+            }],
+            "standards": [],
+            "spec": [],
+            "limits": [],
+        }
+        pr["publication"] = {
+            "status": "verified",
+            "review_url": "https://github.com/EnerZam/WebSynco_React_Front/pull/132#pullrequestreview-555",
+        }
+        summary = self.render(data)
+        md_path = Path(summary["markdown"])
+        self.assertEqual(md_path, self.output / "summary.md")
+        self.assertTrue(md_path.is_file())
+        markdown = md_path.read_text(encoding="utf-8")
+        self.assertIn("EnerZam/WebSynco_React_Front#132", markdown)
+        self.assertIn("`src/pages/Invoices.tsx:42`", markdown)
+        self.assertIn("Guard null date", markdown)
+        self.assertIn("`check-1`", markdown)
+        self.assertIn("Export keeps dates", markdown)
+        self.assertIn("https://github.com/EnerZam/WebSynco_React_Front/pull/132#pullrequestreview-555", markdown)
+        self.assertIn(str(self.output / "scenario-guide.html"), markdown)
+
 
 if __name__ == "__main__":
     unittest.main()
