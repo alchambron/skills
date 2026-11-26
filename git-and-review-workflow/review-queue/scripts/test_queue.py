@@ -22,6 +22,7 @@ HEAD, BASE = 'a' * 40, 'b' * 40
 JOULE = 'EnerZam/JouleMV'
 FRONT = 'EnerZam/WebSynco_React_Front'
 BACKEND = 'EnerZam/WebSynco'
+NATIVE = 'EnerZam/WebSynco_React_Native'
 
 
 def pull(number, reviewer='alchambron', head=HEAD, base=BASE, draft=False, repo=JOULE, state='open'):
@@ -201,8 +202,9 @@ class QueueTests(unittest.TestCase):
             result = self.plan('--number', number)
             self.assertFalse(result['selected'])
             self.assertIn(expected_msg, result['skipped'][0]['reason'])
+            self.assertNotIn('ping', self.last_plan_stdout['skipped'][0])
 
-    def test_multi_repo_search_discovers_all_repos_and_skips_missing_checkout_without_cloning(self):
+    def test_multi_repo_search_discovers_all_repos_and_flags_unmapped_checkout(self):
         missing_repo = 'EnerZam/Uncloned_Repo'
         self.api.prs = {}
         self.api.add(pull(1892, repo=JOULE))
@@ -219,23 +221,63 @@ class QueueTests(unittest.TestCase):
         by_key = {row['key']: row for row in result['selected']}
         self.assertEqual(self.checkouts[FRONT], by_key[f'{FRONT}#132']['checkout'])
         self.assertIn('EnerZam/WebSynco_React_Front/pr-132-', by_key[f'{FRONT}#132']['run_dir_hint'])
-        # Missing checkout is reported once in plan output and digest, never cloned.
         self.assertEqual(1, len(result['skipped']))
-        self.assertEqual(f'{missing_repo}#9', result['skipped'][0]['key'])
-        self.assertIn('no local checkout configured', result['skipped'][0]['reason'])
-        self.assertIn('skipping without cloning', result['skipped'][0]['reason'])
+        skipped = result['skipped'][0]
+        self.assertEqual(f'{missing_repo}#9', skipped['key'])
+        self.assertEqual(f'no local checkout configured for {missing_repo} (unmapped)', skipped['reason'])
+        self.assertEqual('needs_attention', skipped['status'])
+        self.assertEqual(
+            f"https://github.com/{missing_repo}/pull/9 review-queue can't review this pr because there's no "
+            "local checkout (unmapped). add a local checkout to the repository map.",
+            skipped['ping'],
+        )
         self.assertEqual(1, self.last_plan_stdout['skipped_count'])
+        self.assertEqual({field: skipped[field] for field in ('key', 'reason', 'status', 'ping')},
+                         self.last_plan_stdout['skipped'][0])
         search_calls = [params['q'] for ep, params in self.api.requests if ep == 'search/issues']
         self.assertEqual(['is:pr is:open draft:false user-review-requested:alchambron'], search_calls)
 
         # Running plan again does not duplicate the skip in state or digest.
         self.plan()
         state = queue.read_state(self.state)
+        self.assertEqual({}, state['jobs'])
         plan_skips = [s for s in state['skips'] if s.get('pr_key') == f'{missing_repo}#9']
         self.assertEqual(1, len(plan_skips))
+        self.assertEqual(skipped['ping'], plan_skips[0]['ping'])
         today = queue.digest_date(queue.now()).isoformat()
         digest_data = json.loads((self.state / f'digest/{today}.json').read_text())
-        self.assertEqual(1, len([s for s in digest_data['skips'] if s.get('pr_key') == f'{missing_repo}#9']))
+        self.assertEqual(plan_skips, digest_data['skips'])
+
+    def test_native_checkout_default_and_recovery_after_mapping_is_fixed(self):
+        with patch.dict('os.environ', {'REVIEW_QUEUE_REPOS_CONFIG': '', 'REVIEW_QUEUE_T3_PROJECTS': ''}):
+            self.assertEqual(
+                '/Users/alchambron/Documents/Projects/WebSynco/WebSynco_React_Native',
+                queue.load_checkout_map(self.state)[NATIVE.casefold()],
+            )
+
+        self.api.add(pull(372, repo=NATIVE))
+        path = self.root / 'WebSynco_React_Native'
+        queue.save_json(self.repos_config, {**self.checkouts, NATIVE: str(path)})
+        result = self.plan('--repo', NATIVE, '--number', '372')
+        self.assertEqual([], result['selected'])
+        self.assertFalse(path.exists())
+        skipped = result['skipped'][0]
+        self.assertEqual('needs_attention', skipped['status'])
+        self.assertIn(str(path), skipped['reason'])
+        self.assertEqual(
+            f"https://github.com/{NATIVE}/pull/372 review-queue can't review this pr because there's no local "
+            f"checkout at {path}. restore the checkout or update its mapping.",
+            skipped['ping'],
+        )
+
+        (path / '.git').mkdir(parents=True)
+        result = self.plan('--repo', NATIVE, '--number', '372')
+        self.assertEqual([], result['skipped'])
+        selected = result['selected'][0]
+        self.assertEqual(f'{NATIVE}#372', selected['key'])
+        self.assertEqual(str(path), selected['checkout'])
+        self.assertEqual(str(self.state / 'runs' / NATIVE / 'pr-372-aaaaaaaa'), selected['run_dir_hint'])
+        self.assertEqual({}, queue.read_state(self.state)['jobs'])
 
     def test_t3_projects_list_resolves_checkouts_and_reports_missing_git_dir(self):
         t3_file = self.root / 't3-projects.json'
@@ -267,6 +309,7 @@ class QueueTests(unittest.TestCase):
         self.assertEqual([f'{FRONT}#132'], [row['key'] for row in result['selected']])
         self.assertEqual([f'EnerZam/BrokenRepo#5'], [row['key'] for row in result['skipped']])
         self.assertIn('missing or not a git repository', result['skipped'][0]['reason'])
+        self.assertEqual('needs_attention', result['skipped'][0]['status'])
 
     def test_state_migration_is_idempotent_and_preserves_legacy_history(self):
         legacy = {

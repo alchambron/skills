@@ -167,6 +167,18 @@ def render_markdown(data):
         pings.setdefault(key.casefold(), row['ping'])
     lines.extend(f'- {ping}' for ping in pings.values())
 
+    attention = {}
+    for row in data['skips']:
+        key = pr_key_of(row)
+        if key and row.get('status') == 'needs_attention' and row.get('ping') and row.get('url'):
+            attention[key.casefold()] = row
+    if attention:
+        lines.extend(['', '## Needs attention', ''])
+        for row in attention.values():
+            url = row['url']
+            message = row['ping'].removeprefix(f'{url} ')
+            lines.append(f'- {safe_url(url)} {one_line(message)}')
+
     lines.extend(['', '## Recorded results', '', f"Exported {data['generated_at']}.", ''])
     if not data['reviews']:
         lines.append('No finished reviews recorded for this date.')

@@ -110,6 +110,40 @@ class QueueDigestTests(unittest.TestCase):
             self.assertEqual(sorted(path.name for path in target.parent.iterdir()),
                              ['2026-11-19.json', '2026-11-19.md'])
 
+    def test_checkout_failure_exports_actionable_ping_above_results(self):
+        repo = 'EnerZam/WebSynco_React_Native'
+        url = f'https://github.com/{repo}/pull/372'
+        reason = 'configured checkout at /work/WebSynco_React_Native is missing'
+        ping = (f"{url} review-queue can't review this pr because there's no local checkout at "
+                '/work/WebSynco_React_Native. restore the checkout or update its mapping.')
+        blocked = {
+            'at': '2026-11-19T07:00:00+00:00',
+            'command': 'plan',
+            'repository': repo,
+            'number': 372,
+            'url': url,
+            'status': 'needs_attention',
+            'reason': reason,
+            'ping': ping,
+        }
+        earlier = {**blocked, 'at': '2026-11-19T06:59:00+00:00', 'reason': 'unmapped',
+                   'ping': f'{url} add an unmapped checkout to the repository map.'}
+        ordinary = {'at': '2026-11-19T07:01:00+00:00', 'reason': 'draft PR'}
+        state = {'jobs': {}, 'skips': [earlier, blocked, ordinary]}
+        with TemporaryDirectory() as directory:
+            target = export(Path(directory), state, DAY)
+            data = json.loads(target.read_text())
+            self.assertEqual({**blocked, 'pr_key': f'{repo}#372'}, data['skips'][1])
+            self.assertEqual([], data['reviews'])
+            markdown = target.with_suffix('.md').read_text()
+            banner, details = markdown.split('## Recorded results')
+            self.assertIn('## Needs attention', banner)
+            self.assertIn(f"<{url}> review-queue can't review this pr", banner)
+            self.assertIn('restore the checkout or update its mapping.', banner)
+            self.assertNotIn('add an unmapped checkout to the repository map.', banner)
+            self.assertNotIn('draft PR', banner)
+            self.assertIn('draft PR', details)
+
 
 if __name__ == '__main__':
     unittest.main()
