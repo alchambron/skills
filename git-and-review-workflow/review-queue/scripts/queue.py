@@ -26,6 +26,7 @@ DEFAULT_CHECKOUTS = {
     'EnerZam/JouleMV': '/Users/alchambron/Documents/Projects/Joule_MV/JouleMV',
     'EnerZam/WebSynco_React_Front': '/Users/alchambron/Documents/Projects/WebSynco/WebSynco_React_Front',
     'EnerZam/WebSynco': '/Users/alchambron/Documents/Projects/WebSynco/WebSynco',
+    'EnerZam/WebSynco_React_Native': '/Users/alchambron/Documents/Projects/WebSynco/WebSynco_React_Native',
 }
 SKIP_LIMIT = 200
 
@@ -198,14 +199,14 @@ def load_checkout_map(root, repos_config=None, t3_projects=None):
 
 
 def resolve_checkout(repository, checkout_map):
-    """Return (resolved_path, None) or (None, skip_reason). Never clones."""
+    """Return (resolved_path, None) or (None, failure_reason)."""
     norm = normalize_repo(repository)
     raw = (checkout_map or {}).get(norm.casefold())
     if not raw:
-        return None, f'no local checkout configured for {norm}; skipping without cloning'
+        return None, f'no local checkout configured for {norm} (unmapped)'
     path = Path(raw).expanduser()
     if not path.is_dir() or not (path / '.git').exists():
-        return None, f'configured local checkout missing or not a git repository for {norm}: {path}'
+        return None, f'configured local checkout for {norm} is missing or not a git repository at {path}'
     return str(path.resolve()), None
 
 
@@ -586,6 +587,7 @@ def add_plan_skips(state, skipped):
             'head': row.get('head'),
             'base': row.get('base'),
             'reason': row['reason'],
+            **{field: row[field] for field in ('status', 'ping') if field in row},
         }
         identity = (record['pr_key'], record['command'], record['reason'], record['head'], record['base'])
         if identity in known:
@@ -623,7 +625,22 @@ def plan_reviews(api, history, prior, state, number=None, repository=None, check
             continue
         checkout, checkout_error = resolve_checkout(repo, checkout_map)
         if checkout_error is not None:
-            skipped.append({**item, **revision, 'reason': checkout_error})
+            configured_path = (checkout_map or {}).get(repo.casefold())
+            if configured_path:
+                path = ' '.join(str(Path(configured_path).expanduser()).splitlines())
+                location = f'at {path}'
+                action = 'restore the checkout or update its mapping.'
+            else:
+                location = '(unmapped)'
+                action = 'add a local checkout to the repository map.'
+            skipped.append({
+                **item,
+                **revision,
+                'status': 'needs_attention',
+                'reason': checkout_error,
+                'ping': (f"{item['url']} review-queue can't review this pr because there's no local checkout "
+                         f"{location}. {action}"),
+            })
             continue
         entry = _lookup_prior(prior, key)
         kind, basis = history.classify(entry, revision['head'], False)
@@ -1038,7 +1055,10 @@ def main(argv=None):
                 'selection': str(args.output),
                 'count': len(selection['selected']),
                 'skipped_count': len(selection['skipped']),
-                'skipped': [{'key': s['key'], 'reason': s['reason']} for s in selection['skipped']],
+                'skipped': [
+                    {field: row[field] for field in ('key', 'reason', 'status', 'ping') if field in row}
+                    for row in selection['skipped']
+                ],
             }))
             return 0
 

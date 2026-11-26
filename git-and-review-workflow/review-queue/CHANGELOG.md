@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.5.0
+
+- Added the WebSynco React Native checkout to the built-in repository map.
+- Marked eligible PRs with missing, invalid, or unmapped checkouts as `needs_attention`. Plan output and the dated digest now carry a reason and a one-line ping with the PR link and the required checkout fix.
+
 ## 1.4.0
 
 ### Multi-repository support
